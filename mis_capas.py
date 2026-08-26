@@ -1,30 +1,41 @@
 #PROGRAMA CAPAS
-# --- BLOQUE MAESTRO DE IMPORTACIONES ---
-import pandas as pd
-import numpy as np
+# ==============================================================================
+# LIBRERÍAS DEL PIPELINE JCR Q1 (DISEÑO DE EXPERIMENTOS & MACHINE LEARNING)
+# ==============================================================================
+
+# 1. Librerías estándar de Python
 import re
 import warnings
 
-# Gráficos
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import seaborn as sns
+# 2. Manipulación de datos y álgebra lineal
+import numpy as np
+import pandas as pd
 
-# Estadísticas y Modelos Clásicos (Capa 1 y 1.5)
+# 3. Modelado Estadístico Tradicional (Statsmodels)
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.tools.tools import add_constant
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.stats.diagnostic import het_breuschpagan
-from scipy.stats import shapiro
 
-# Machine Learning (Capa 2 y 3 - Se usarán en las siguientes funciones)
+# 4. Computación Científica y Optimización (SciPy)
+from scipy.stats import shapiro
+from scipy.optimize import differential_evolution
+from scipy.special import expit
+
+# 5. Machine Learning y Feature Selection (Scikit-Learn)
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import ElasticNetCV
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
+from sklearn.model_selection import KFold, cross_val_score
 
-# Ignorar advertencias no críticas en la consola
+# 6. Visualización Científica (Matplotlib & Seaborn)
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import seaborn as sns
+
+# Configuración global opcional para suprimir warnings estéticos
 warnings.filterwarnings("ignore")
 # ---------------------------------------
 
