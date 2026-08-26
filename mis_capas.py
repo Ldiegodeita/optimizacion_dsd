@@ -6,6 +6,7 @@
 
 # 1. Librerías estándar de Python
 import re
+import os
 import warnings
 
 # 2. Manipulación de datos y álgebra lineal
@@ -40,190 +41,180 @@ import seaborn as sns
 warnings.filterwarnings("ignore")
 # ---------------------------------------
 
-def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_respuestas: list) -> tuple:
+def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_respuestas: list, ruta_tablas: str, ruta_graficas: str) -> tuple:
     """
-    Ejecuta un análisis RSM utilizando selección Stepwise con Herencia Fuerte, 
-    evalúa la ortogonalidad (FIV), normalidad (Shapiro) y homocedasticidad (Breusch-Pagan).
-    Genera gráficos 3D contrastando 'Argón' vs 'CO2'.
+    Ajusta un modelo de Superficie de Respuesta (RSM) global para cada variable dependiente.
+    Genera y exporta la tabla ANOVA, valida los supuestos de los residuos (Shapiro, Breusch-Pagan), 
+    calcula la multicolinealidad (FIV) y exporta silenciosamente gráficos de superficie 3D.
     
-    Args:
-        datos_completos (pd.DataFrame): Dataset experimental completo.
-        alpha (float): Nivel de significancia estadístico (ej. 0.05).
-        lista_respuestas (list): Lista de nombres de las variables de respuesta.
+    Argumentos:
+        datos_completos (pd.DataFrame): Dataset completo (DSD).
+        alpha (float): Nivel de significancia (ej. 0.05).
+        lista_respuestas (list): Nombres de las columnas de respuesta (Y).
+        ruta_tablas (str): Directorio donde se guardarán los archivos .csv del ANOVA.
+        ruta_graficas (str): Directorio donde se guardarán los gráficos .png.
         
-    Returns:
+    Retorna:
         tuple: (factores_sig: list, residuos_ok: bool)
     """
-    # 1. Validación inicial y configuración
+    # 1. Validación inicial estricta
     assert not datos_completos.empty, "Error: El DataFrame de entrada está vacío."
-    warnings.filterwarnings("ignore")
     
+    # Asegurar que los directorios de salida existan
+    os.makedirs(ruta_tablas, exist_ok=True)
+    os.makedirs(ruta_graficas, exist_ok=True)
+    
+    # 2. Configuración estética JCR Q1 para exportación de gráficos
     plt.rcParams.update({
         'font.family': 'serif', 'font.serif': ['Times New Roman'],
-        'axes.labelsize': 10, 'axes.titlesize': 11,
-        'xtick.labelsize': 8, 'ytick.labelsize': 8,
+        'axes.labelsize': 10, 'axes.titlesize': 12,
+        'xtick.labelsize': 9, 'ytick.labelsize': 9,
         'figure.dpi': 300
     })
 
-    # 2. Saneamiento de nombres para statsmodels (evita fallos por símbolos)
-    def clean_name(name):
-        return re.sub(r'_+', '_', re.sub(r'[^a-zA-Z0-9_]', '_', str(name))).strip('_')
+    # 3. Identificación de Factores (X) y Manejo de Categórica
+    # Tolerancia a variaciones en el nombre de la Atmósfera
+    cat_original = next((col for col in datos_completos.columns if col.strip().lower() in ['atmósfera', 'ATMOSFERA']), None)
+    if not cat_original:
+        raise ValueError("No se encontró la columna de la atmósfera en el dataset.")
+        
+    factores_continuos = [col for col in datos_completos.columns 
+                          if col not in lista_respuestas and col != cat_original]
     
-    col_map = {col: clean_name(col) for col in datos_completos.columns}
-    inv_map = {v: k for k, v in col_map.items()}
+    # 4. Saneamiento de Nombres (Requerido por smf.ols para evitar fallos de sintaxis)
+    def sanitize_str(s): 
+        return re.sub(r'\W+', '_', s).strip('_')
     
-    df_clean = datos_completos.rename(columns=col_map)
-    resp_clean = [col_map[r] for r in lista_respuestas]
+    name_map = {col: sanitize_str(col) for col in datos_completos.columns}
+    inv_map = {v: k for k, v in name_map.items()}
     
-    # Identificar columna categórica y factores continuos (excluyendo respuestas y Atmósfera)
-    cat_var = col_map.get('Atmósfera', 'Atmósfera')
-    cont_vars = [c for c in df_clean.columns if c not in resp_clean and c != cat_var]
-
-    # 3. Creación de Matriz Codificada Ortogonal [-1, 1]
-    df_coded = df_clean.copy()
+    df_clean = datos_completos.copy()
+    df_clean.columns = [name_map[col] for col in datos_completos.columns]
     
-    # Codificar Atmósfera
-    if cat_var in df_coded.columns:
-        df_coded[cat_var] = np.where(df_coded[cat_var].astype(str).str.upper().str.contains('CO2'), 1, -1)
+    # Asegurar tipología estricta de la variable categórica
+    cat_var = name_map[cat_original]
+    df_clean[cat_var] = df_clean[cat_var].astype(str).str.strip().str.capitalize() # 'Argón', 'Co2'
     
-    # Codificar continuos y guardar parámetros de escala para decodificar gráficos
-    scale_params = {}
-    for col in cont_vars:
-        if df_clean[col].dtype == object or df_clean[col].dtype.name == 'category':
-            # Si se coló otra categórica (ej. Ánodo), forzar binario
-            levels = df_clean[col].unique()
-            df_coded[col] = np.where(df_clean[col] == levels[0], -1, 1)
-        else:
-            min_v, max_v = df_clean[col].min(), df_clean[col].max()
-            scale_params[col] = (min_v, max_v)
-            df_coded[col] = 2 * (df_clean[col] - min_v) / (max_v - min_v) - 1 if max_v > min_v else 0
-
-    def map_to_coded(val_array, min_v, max_v):
-        return 2 * (val_array - min_v) / (max_v - min_v) - 1
-
-    # 4. Motor interno: Stepwise con Herencia Fuerte
-    def _stepwise_heredity(response, data):
-        included = []
-        all_factors = [cat_var] + cont_vars
-        while True:
-            changed = False
-            valid_mains = [m for m in all_factors if m not in included]
-            valid_inters = [f"{included[i]}:{included[j]}" for i in range(len(included)) 
-                            for j in range(i+1, len(included))]
-            valid_quads = [f"I({f}**2)" for f in included if f in cont_vars]
-            
-            # Limpiar interacciones ya incluidas
-            valid_inters = [t for t in valid_inters if t not in included and f"{t.split(':')[1]}:{t.split(':')[0]}" not in included]
-            valid_quads = [q for q in valid_quads if q not in included]
-            
-            candidates = valid_mains + valid_inters + valid_quads
-            
-            best_pval, best_candidate = 1.0, None
-            for candidate in candidates:
-                formula = f"{response} ~ " + " + ".join(included + [candidate]) if included else f"{response} ~ {candidate}"
-                try:
-                    pval = smf.ols(formula, data).fit().pvalues.get(candidate, 1.0)
-                    if pval < best_pval:
-                        best_pval, best_candidate = pval, candidate
-                except: pass
-                
-            if best_pval < alpha:
-                included.append(best_candidate)
-                changed = True
-                
-            formula = f"{response} ~ " + " + ".join(included) if included else f"{response} ~ 1"
-            try:
-                pvalues = smf.ols(formula, data).fit().pvalues.drop('Intercept', errors='ignore')
-                if not pvalues.empty and pvalues.max() > alpha:
-                    included.remove(pvalues.idxmax())
-                    changed = True
-            except: pass
-                
-            if not changed: break
-        return included
-
+    cont_vars = [name_map[c] for c in factores_continuos]
+    resp_vars = [name_map[r] for r in lista_respuestas]
+    
     factores_sig_set = set()
     residuos_ok = True
 
-    # 5. Iteración de Modelado y Gráficos
-    for resp in resp_clean:
-        print(f"\n--- Modelando: {inv_map[resp]} ---")
-        selected_terms = _stepwise_heredity(resp, df_coded)
+    # 5. Iteración de Modelado sobre cada Respuesta
+    for resp in resp_vars:
+        resp_original = inv_map[resp]
+        # Crear un nombre seguro para los archivos exportados (evita fallos por '/' o '%' en nombres)
+        safe_filename = sanitize_str(resp_original)
         
-        if not selected_terms:
-            print("  -> Ningún factor significativo al nivel alfa establecido.")
-            continue
+        print(f"\n[{resp_original}] Modelando Superficie de Respuesta (RSM)...")
+        
+        # Construcción de la Ecuación del Modelo RSM (Principales + Cuadráticos + Interacciones)
+        main_eff = " + ".join(cont_vars)
+        quad_eff = " + ".join([f"I({c}**2)" for c in cont_vars])
+        inter_eff = " + ".join([f"{cont_vars[i]}:{cont_vars[j]}" 
+                                for i in range(len(cont_vars)) for j in range(i+1, len(cont_vars))])
+        
+        formula = f"{resp} ~ C({cat_var}) + {main_eff} + {quad_eff} + {inter_eff}"
+        
+        try:
+            model = smf.ols(formula, data=df_clean).fit()
             
-        formula_final = f"{resp} ~ " + " + ".join(selected_terms)
-        model = smf.ols(formula=formula_final, data=df_coded).fit()
-        
-        # Validación Estadística
+            # --- 6. Tabla ANOVA Formal ---
+            # typ=2 evalúa el efecto marginal de cada variable
+            tabla_anova = anova_lm(model, typ=2)
+            ruta_csv = os.path.join(ruta_tablas, f"anova_{safe_filename}.csv")
+            tabla_anova.to_csv(ruta_csv)
+            print(f"  -> Tabla ANOVA exportada: {ruta_csv}")
+            
+        except Exception as e:
+            print(f"  -> Error al ajustar el modelo OLS/ANOVA para {resp_original}: {e}")
+            continue
+
+        # --- 7. Cálculo de FIV ---
+        exog = model.model.exog
+        vifs = []
+        for i in range(1, exog.shape[1]): # Ignorar el Intercepto
+            try:
+                vifs.append(variance_inflation_factor(exog, i))
+            except: pass
+        max_vif = np.nanmax(vifs) if vifs else np.nan
+        print(f"  -> FIV Máximo de la matriz de diseño: {max_vif:.2f}")
+
+        # --- 8. Validación de Supuestos de Residuos ---
         p_shapiro = shapiro(model.resid)[1]
         try:
-            p_bp = het_breuschpagan(model.resid, model.model.exog)[1]
+            p_bp = het_breuschpagan(model.resid, exog)[1]
         except:
             p_bp = np.nan
             
-        print(f"  -> Shapiro-Wilk (p): {p_shapiro:.4f} | Breusch-Pagan (p): {p_bp:.4f}")
-        if p_shapiro < 0.05 or p_bp < 0.05:
-            residuos_ok = False
-            
-        # Cálculo de FIV
-        exog_matrix = model.model.exog
-        vifs = [variance_inflation_factor(exog_matrix, i) for i in range(1, exog_matrix.shape[1])]
-        print(f"  -> FIV Máximo: {np.nanmax(vifs):.2f}" if vifs else "  -> FIV: N/A")
-
-        # Extracción de factores significativos
-        for term, pval in model.pvalues.items():
-            if pval < alpha and term != 'Intercept':
-                # Rescatar nombres originales
-                for orig_col in cont_vars + [cat_var]:
-                    if orig_col in term:
-                        factores_sig_set.add(inv_map.get(orig_col, orig_col))
-
-        # Configuración de Gráfico 3D (Los dos continuos más significativos)
-        p_mains = {c: model.pvalues[c] for c in cont_vars if c in model.pvalues}
-        if len(p_mains) < 2:
-            print("  -> Insuficientes factores continuos para gráfico 3D.")
-            continue
-            
-        top2 = sorted(p_mains, key=p_mains.get)[:2]
-        f_x, f_y = top2[0], top2[1]
+        print(f"  -> p-valor Shapiro-Wilk (Normalidad): {p_shapiro:.4f}")
+        print(f"  -> p-valor Breusch-Pagan (Homocedasticidad): {p_bp:.4f}")
         
-        # Renderizado decodificando a unidades reales
-        fig = plt.figure(figsize=(12, 5))
-        x_real = np.linspace(df_clean[f_x].min(), df_clean[f_x].max(), 35)
-        y_real = np.linspace(df_clean[f_y].min(), df_clean[f_y].max(), 35)
-        X_grid_real, Y_grid_real = np.meshgrid(x_real, y_real)
+        # Si alguna de las pruebas falla el alpha, flag se vuelve False
+        if p_shapiro < alpha or (not np.isnan(p_bp) and p_bp < alpha):
+            residuos_ok = False
 
-        for i, (atm_str, atm_coded) in enumerate([('Argón', -1), ('CO2', 1)]):
-            pred_coded = pd.DataFrame({
-                f_x: map_to_coded(X_grid_real.ravel(), *scale_params[f_x]),
-                f_y: map_to_coded(Y_grid_real.ravel(), *scale_params[f_y]),
-                cat_var: atm_coded
-            })
-            # Mantener resto en su punto central (0 en codificado)
-            for f in cont_vars:
-                if f not in [f_x, f_y]: pred_coded[f] = 0.0
-                    
-            Z_pred = model.predict(pred_coded).values.reshape(X_grid_real.shape)
+        # --- 9. Recolección de Factores Significativos ---
+        pvalues = model.pvalues
+        for term, pval in pvalues.items():
+            if pval < alpha and term != 'Intercept':
+                # Decodificar el nombre de la variable al formato original
+                for raw, clean in name_map.items():
+                    if clean in term and raw not in lista_respuestas:
+                        factores_sig_set.add(raw)
+
+        # --- 10. Graficación Silenciosa 3D ---
+        # Extraer los 2 factores continuos con mayor significancia (menor p-value)
+        p_mains = {c: pvalues[c] for c in cont_vars if c in pvalues}
+        if len(p_mains) >= 2:
+            top2 = sorted(p_mains, key=p_mains.get)[:2]
+            f_x, f_y = top2[0], top2[1]
             
-            ax = fig.add_subplot(1, 2, i+1, projection='3d')
-            surf = ax.plot_surface(X_grid_real, Y_grid_real, Z_pred, cmap=['viridis', 'plasma'][i], 
-                                   edgecolor='none', alpha=0.85)
+            fig = plt.figure(figsize=(14, 6))
+            atm_levels = ['Argón', 'Co2']
+            cmaps = ['viridis', 'plasma']
             
-            ax.set_title(f"Atmósfera: {atm_str}", fontweight='bold', pad=10)
-            ax.set_xlabel(inv_map.get(f_x, f_x), labelpad=10)
-            ax.set_ylabel(inv_map.get(f_y, f_y), labelpad=10)
-            ax.set_zlabel('Respuesta', labelpad=10)
-            ax.view_init(elev=20, azim=135)
-            fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, pad=0.1)
+            x_range = np.linspace(df_clean[f_x].min(), df_clean[f_x].max(), 30)
+            y_range = np.linspace(df_clean[f_y].min(), df_clean[f_y].max(), 30)
+            X_grid, Y_grid = np.meshgrid(x_range, y_range)
+            
+            for i, atm in enumerate(atm_levels):
+                pred_df = pd.DataFrame({
+                    f_x: X_grid.ravel(),
+                    f_y: Y_grid.ravel(),
+                    cat_var: atm
+                })
+                # El resto de los predictores se fijan en su mediana
+                for f in cont_vars:
+                    if f not in [f_x, f_y]:
+                        pred_df[f] = df_clean[f].median()
+                        
+                Z_pred = model.predict(pred_df).values.reshape(X_grid.shape)
+                
+                ax = fig.add_subplot(1, 2, i+1, projection='3d')
+                surf = ax.plot_surface(X_grid, Y_grid, Z_pred, cmap=cmaps[i], 
+                                       edgecolor='none', alpha=0.9, antialiased=True)
+                
+                ax.set_title(f"Atmósfera: {atm.upper()}", fontweight='bold', pad=10)
+                ax.set_xlabel(inv_map[f_x], labelpad=10)
+                ax.set_ylabel(inv_map[f_y], labelpad=10)
+                ax.set_zlabel(resp_original, labelpad=10)
+                ax.view_init(elev=25, azim=135)
+                fig.colorbar(surf, ax=ax, shrink=0.5, aspect=12, pad=0.1)
 
-        plt.suptitle(f"Superficie RSM Codificada - {inv_map[resp]}", fontsize=12, fontweight='bold', y=0.95)
-        plt.subplots_adjust(wspace=0.15)
-        plt.show()
+            plt.suptitle(f"Superficie de Respuesta RSM - Variable: {resp_original}", 
+                         fontsize=14, fontweight='bold', y=0.95)
+            plt.subplots_adjust(wspace=0.2)
+            
+            # Guardado Silencioso y liberación de memoria RAM
+            ruta_img = os.path.join(ruta_graficas, f"superficie_RSM_{safe_filename}.png")
+            plt.savefig(ruta_img, bbox_inches='tight', dpi=300)
+            plt.close(fig)
+            print(f"  -> Gráfico RSM exportado silenciosamente: {ruta_img}")
 
-    return list(factores_sig_set), residuos_ok
+    factores_sig = list(factores_sig_set)
+    return factores_sig, residuos_ok
 
 def aislar_subconjunto_co2(datos_completos: pd.DataFrame, lista_respuestas: list) -> tuple:
     """
@@ -397,7 +388,8 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
             plt.xlabel("Magnitud del Coeficiente Estandarizado")
             plt.ylabel("")
             plt.tight_layout()
-            plt.show()
+            plt.savefig(f"resultados_dsd/graficas/nombre_del_grafico.png", bbox_inches='tight', dpi=300)
+            plt.close(fig)
         else:
             print(f"  -> [{resp}]: Todos los factores fueron fuertemente penalizados a cero.")
 
@@ -559,7 +551,8 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
 
         plt.suptitle(f"Dependencia Parcial GPR - {resp}", fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
-        plt.show()
+        plt.savefig(f"resultados_dsd/graficas/nombre_del_grafico.png", bbox_inches='tight', dpi=300)
+        plt.close(fig)
 
     # 11. Cálculo de métrica global
     ecm_cv_promedio = float(np.mean(ecm_list)) if ecm_list else np.nan
@@ -567,71 +560,63 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
     
     return modelos_gpr, ecm_cv_promedio
 
-def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: list, es_multiobjetivo: bool) -> tuple:
-    """
-    Motor de Optimización Bayesiana para buscar las condiciones operativas ideales.
-    Utiliza Differential Evolution sobre la función de adquisición LCB del espacio 
-    probabilístico modelado por Procesos Gaussianos.
+def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: list, diccionario_respuestas: dict) -> tuple:
+    print("\n--- FASE 4: OPTIMIZACIÓN BAYESIANA MULTIOBJETIVO Y TOPOLOGÍA ---")
     
-    Argumentos:
-        modelos_gpr (dict): Diccionario de modelos GPR entrenados y sus escaladores.
-        kappa (float): Hiperparámetro de exploración-explotación para LCB.
-        variables_limpias (list): Factores independientes continuos.
-        es_multiobjetivo (bool): Define si optimiza una o todas las variables simultáneamente.
+    if not modelos_gpr:
+        raise ValueError("Error: El diccionario de modelos GPR está vacío.")
         
-    Retorna:
-        tuple: (top_optimos: pd.DataFrame, superficie_estable: bool)
-    """
-    print("\n--- FASE 5: OPTIMIZACIÓN BAYESIANA Y EVALUACIÓN TOPOLÓGICA ---")
-    
-    # 1. Extraemos el scaler base para configurar los límites geométricos
     primer_resp = list(modelos_gpr.keys())[0]
     scaler_X_base = modelos_gpr[primer_resp]['scaler_X']
     
-    # 2. Definición de Límites (Bounds) con ligera extrapolación [-1.5, 1.5] varianzas
     limites_std_inf = np.full(len(variables_limpias), -1.5)
     limites_std_sup = np.full(len(variables_limpias), 1.5)
     
-    # Decodificación de los límites a unidades de ingeniería reales
     lim_reales_inf = scaler_X_base.inverse_transform(limites_std_inf.reshape(1, -1))[0]
     lim_reales_sup = scaler_X_base.inverse_transform(limites_std_sup.reshape(1, -1))[0]
     
     bounds = list(zip(np.minimum(lim_reales_inf, lim_reales_sup), 
                       np.maximum(lim_reales_inf, lim_reales_sup)))
 
-    # 3. Función Objetivo de Adquisición Bayesiana
     def funcion_objetivo(x):
-        lcbs = []
-        for resp, m_dict in modelos_gpr.items():
-            # Estandarización matemática del vector de búsqueda
+        adquisiciones = []
+        
+        for resp, directiva in diccionario_respuestas.items():
+            if directiva.lower() == 'none' or resp not in modelos_gpr:
+                continue 
+                
+            m_dict = modelos_gpr[resp]
             x_scaled = m_dict['scaler_X'].transform(x.reshape(1, -1))
             
-            # Predicción probabilística del GPR (Media y Desviación)
             mu_scaled, std_scaled = m_dict['modelo'].predict(x_scaled, return_std=True)
+            mu = mu_scaled[0]
+            std = std_scaled[0]
             
-            # Cálculo del Lower Confidence Bound (Adquisición de Maximización Robusta)
-            lcb = mu_scaled[0] - kappa * std_scaled[0]
-            lcbs.append(lcb)
+            if directiva.lower() == 'max':
+                acq = mu - (kappa * std)
+            elif directiva.lower() == 'min':
+                acq = -(mu + (kappa * std))
+            else:
+                raise ValueError(f"Directiva '{directiva}' no reconocida.")
+                
+            adquisiciones.append(acq)
             
-        if es_multiobjetivo:
-            # Transformación sigmoidea para acotar la LCB al dominio [0, 1]
-            lcbs_norm = expit(lcbs)
-            # Deseabilidad Global: Media Geométrica de Harrington
-            # Se suma un epsilon (1e-12) para evitar el colapso matemático del logaritmo
-            deseabilidad_global = np.exp(np.mean(np.log(lcbs_norm + 1e-12)))
-            return -deseabilidad_global # Negativo porque differential_evolution minimiza
-        else:
-            return -lcbs[0]
+        if not adquisiciones:
+            return 0.0
 
-    # 4. Optimización Evolutiva (Algoritmo Genético Diferencial)
-    print("  -> Iniciando algoritmo genético Differential Evolution...")
+        adq_norm = expit(adquisiciones)
+        deseabilidad_global = np.exp(np.mean(np.log(adq_norm + 1e-12)))
+        
+        return -deseabilidad_global
+
+    print("  -> Evolucionando hiperespacio con Algoritmo Genético Diferencial...")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         resultado = differential_evolution(
             funcion_objetivo, 
             bounds=bounds, 
             strategy='best1bin', 
-            maxiter=1000, 
+            maxiter=1500, 
             popsize=15, 
             mutation=(0.5, 1.0), 
             recombination=0.7, 
@@ -639,21 +624,21 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
         )
         
     x_optimo = resultado.x
-    print("  -> Convergencia alcanzada.")
+    print("  -> Convergencia del Óptimo Global alcanzada.")
 
-    # 5. Análisis de Sensibilidad Topológica (Estabilidad de la Superficie GPR)
     def obtener_sigma_promedio(x_val):
         sigmas = []
-        for m_dict in modelos_gpr.values():
-            x_sc = m_dict['scaler_X'].transform(x_val.reshape(1, -1))
-            _, std_sc = m_dict['modelo'].predict(x_sc, return_std=True)
-            sigmas.append(std_sc[0])
-        return np.mean(sigmas)
+        for resp, directiva in diccionario_respuestas.items():
+            if directiva.lower() != 'none' and resp in modelos_gpr:
+                m_dict = modelos_gpr[resp]
+                x_sc = m_dict['scaler_X'].transform(x_val.reshape(1, -1))
+                _, std_sc = m_dict['modelo'].predict(x_sc, return_std=True)
+                sigmas.append(std_sc[0])
+        return np.mean(sigmas) if sigmas else 0.0
 
     sigma_centroide = obtener_sigma_promedio(x_optimo)
     rango_espacial = np.array([b[1] - b[0] for b in bounds])
     
-    # Generación de la vecindad de perturbación (+- 2% lineal y proporcional)
     puntos_vecinos = [
         x_optimo + 0.02 * rango_espacial,
         x_optimo - 0.02 * rango_espacial,
@@ -662,40 +647,36 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
     ]
     
     superficie_estable = True
-    for v in puntos_vecinos:
-        # Clipping para asegurar que la perturbación no escape del dominio
-        v_clip = np.clip(v, [b[0] for b in bounds], [b[1] for b in bounds])
-        sigma_vecino = obtener_sigma_promedio(v_clip)
+    for vec in puntos_vecinos:
+        vec_clip = np.clip(vec, [b[0] for b in bounds], [b[1] for b in bounds])
+        sigma_vecino = obtener_sigma_promedio(vec_clip)
         
-        # Penalización estricta: Si el error de incertidumbre crece > 20% a un paso de distancia
-        if sigma_vecino > 1.20 * sigma_centroide:
+        if sigma_centroide > 0 and sigma_vecino > 1.20 * sigma_centroide:
             superficie_estable = False
             break
 
     if superficie_estable:
-        print("  -> Topología estable: El óptimo es robusto (Incertidumbre controlada en su vecindad).")
+        print("  -> Topología Estable: El punto operativo recomendado es robusto frente a perturbaciones (±2%).")
     else:
-        print("  -> ADVERTENCIA Topológica: Singularidad detectada. Alto gradiente de incertidumbre cerca del óptimo.")
+        print("  -> ADVERTENCIA: Singularidad Operativa detectada. Gradiente de incertidumbre peligroso cerca del óptimo.")
 
-    # 6. Consolidación de Resultados en DataFrame (Unidades Reales)
     datos_output = {}
     
-    # Registrar factores operativos recomendados
     for i, var in enumerate(variables_limpias):
-        datos_output[f"SetPoint_{var}"] = x_optimo[i]
+        datos_output[f"SetPoint_{var}"] = np.round(x_optimo[i], 4)
         
-    # Registrar expectativas termodinámicas/cinéticas
-    for resp, m_dict in modelos_gpr.items():
-        x_sc_final = m_dict['scaler_X'].transform(x_optimo.reshape(1, -1))
-        mu_sc_final, std_sc_final = m_dict['modelo'].predict(x_sc_final, return_std=True)
-        
-        # Decodificación a unidades del paper
-        mu_real = m_dict['scaler_y'].inverse_transform(mu_sc_final.reshape(-1, 1))[0][0]
-        std_real = std_sc_final[0] * m_dict['scaler_y'].scale_[0]
-        
-        datos_output[f"E_Pred_{resp}"] = mu_real
-        datos_output[f"E_Std_{resp}"] = std_real
-        
+    for resp in diccionario_respuestas.keys():
+        if resp in modelos_gpr:
+            m_dict = modelos_gpr[resp]
+            x_sc_final = m_dict['scaler_X'].transform(x_optimo.reshape(1, -1))
+            mu_sc_final, std_sc_final = m_dict['modelo'].predict(x_sc_final, return_std=True)
+            
+            mu_real = m_dict['scaler_y'].inverse_transform(mu_sc_final.reshape(-1, 1))[0][0]
+            std_real = std_sc_final[0] * m_dict['scaler_y'].scale_[0]
+            
+            datos_output[f"E_Pred_{resp}"] = np.round(mu_real, 4)
+            datos_output[f"E_Std_{resp}"] = np.round(std_real, 4)
+            
     top_optimos = pd.DataFrame([datos_output])
     
     return top_optimos, superficie_estable
