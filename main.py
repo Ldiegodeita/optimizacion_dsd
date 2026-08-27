@@ -75,7 +75,6 @@ class DSDConfigurator:
             self.datos = pd.read_csv(self.ruta_archivo)
             
             # --- LIMPIEZA INMEDIATA DE NOMBRES (BOM y espacios) ---
-            # Esto asegura que la GUI muestre los nombres limpios y sin caracteres basura
             self.datos.columns = [str(c).strip().replace('\ufeff', '') for c in self.datos.columns]
             # ----------------------------------------------------
             
@@ -115,8 +114,8 @@ class DSDConfigurator:
     def iniciar_pipeline(self):
         for col, cb in self.comboboxes.items():
             self.configuracion[col] = cb.get()
+        # FIX ARQUITECTÓNICO: Solo detenemos el mainloop, NO destruimos la ventana aún.
         self.root.quit() 
-        self.root.destroy()
 
 def orquestador_principal():
     warnings.filterwarnings("ignore")
@@ -127,31 +126,33 @@ def orquestador_principal():
     
     if app.datos is None:
         print("Operación cancelada por el usuario.")
+        root.destroy()
         return
         
+    # FIX ARQUITECTÓNICO: Rescatar variables a memoria local ANTES de destruir la ventana
+    df = app.datos.copy()
+    configuracion_local = app.configuracion.copy()
+    root.destroy() # Ahora sí, liberamos los recursos de la GUI de forma segura
+    
     print("\n" + "="*60)
     print(" PREPROCESAMIENTO Y CODIFICACIÓN DE VARIABLES ")
     print("="*60)
-    
-    df = app.datos.copy()
     
     # 1. Limpieza Profunda: Eliminación de BOM (Fantasma de Minitab) y espacios
     nombres_limpios = {c: str(c).strip().replace('\ufeff', '') for c in df.columns}
     df.rename(columns=nombres_limpios, inplace=True)
     
     # 2. Reconstrucción del diccionario de configuración con llaves limpias
-    config = {nombres_limpios[k]: v for k, v in app.configuracion.items()}
+    config = {nombres_limpios[k]: v for k, v in configuracion_local.items()}
     
     cols_ignorar = [c for c, rol in config.items() if "Ignorar" in rol]
     cols_categoricas = [c for c, rol in config.items() if "Categórico" in rol]
     
     # --- PROTECCIÓN ESTRUCTURAL (PARCHE PARA LA CAPA 1) ---
-    # Búsqueda ultra-robusta sin importar mayúsculas, minúsculas o nombres extraños
     col_atm = next((c for c in cols_categoricas if 'atm' in c.lower() or 'gas' in c.lower()), None)
     
     if col_atm:
         cols_categoricas.remove(col_atm)
-        # ESTO ES MAGIA: Forzamos el nombre a la sintaxis exacta que la Capa 1 de IA espera.
         df.rename(columns={col_atm: 'Atmósfera'}, inplace=True)
         print(f"-> Columna '{col_atm}' identificada, protegida de One-Hot y estandarizada a 'Atmósfera'.")
     else:
@@ -192,8 +193,6 @@ def orquestador_principal():
         print(f"\n--- INICIANDO ITERACIÓN {iteracion} ---")
         
         try:
-            # Nota: Si aún no refactorizas la Capa 1 en AI Studio, borra temporalmente 
-            # ruta_tablas y ruta_graficas de los argumentos de abajo para que no marque error.
             factores_sig, residuos_ok = ejecutar_anova_global(
                 df, hiperparametros['alpha'], lista_todas_resp, ruta_tablas, ruta_graficas
             )
@@ -202,12 +201,14 @@ def orquestador_principal():
                 df, lista_todas_resp
             )
             
+            # FIX ARQUITECTÓNICO: Inyección de dependencia ruta_graficas
             variables_limpias = aplicar_elastic_net(
-                datos_co2, factores_sig, lista_todas_resp, hiperparametros['l1_ratio']
+                datos_co2, factores_sig, lista_todas_resp, hiperparametros['l1_ratio'], ruta_graficas
             )
             
+            # FIX ARQUITECTÓNICO: Inyección de dependencia ruta_graficas
             modelos_gpr, ecm_cv_promedio = entrenar_gpr(
-                datos_co2, variables_limpias, lista_todas_resp
+                datos_co2, variables_limpias, lista_todas_resp, ruta_graficas
             )
             
             top_optimos, superficie_estable = buscar_optimo_bayesiano(
@@ -220,13 +221,24 @@ def orquestador_principal():
                 print(top_optimos.to_string(index=False))
                 optimo_validado = True
             else:
-                print("\n⚠️ Ajustando hiperparámetros recursivamente...")
+                print("\n⚠️ El modelo no cumple los criterios de estabilidad o error. Ajustando hiperparámetros recursivamente...")
                 hiperparametros['l1_ratio'] = min(0.95, hiperparametros['l1_ratio'] + 0.15)
                 iteracion += 1
+                continue
                 
         except Exception as e:
-            print(f"\n❌ Error Crítico en la iteración {iteracion}: {e}")
-            break
+            # FIX ARQUITECTÓNICO: Bucle de Resiliencia (Auto-Healing)
+            print(f"\n⚠️ Error Crítico en la iteración {iteracion}: {e}")
+            print("  -> Auto-corrigiendo hiperparámetros y reintentando...")
+            
+            # Relajamos la penalización L1 para permitir que pasen más variables si ElasticNet asfixió el modelo
+            hiperparametros['l1_ratio'] = max(0.1, hiperparametros['l1_ratio'] - 0.20)
+            
+            # Relajamos el umbral ANOVA por si se descartaron demasiados factores en el primer paso
+            hiperparametros['alpha'] = min(0.25, hiperparametros['alpha'] + 0.05)
+            
+            iteracion += 1
+            continue
 
 if __name__ == "__main__":
     orquestador_principal()

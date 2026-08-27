@@ -1,5 +1,3 @@
-#OFICINA
-#PROGRAMA CAPAS
 # ==============================================================================
 # LIBRERÍAS DEL PIPELINE JCR Q1 (DISEÑO DE EXPERIMENTOS & MACHINE LEARNING)
 # ==============================================================================
@@ -19,6 +17,7 @@ import statsmodels.formula.api as smf
 from statsmodels.tools.tools import add_constant
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.stats.anova import anova_lm  # Importación explícita asegurada
 
 # 4. Computación Científica y Optimización (SciPy)
 from scipy.stats import shapiro
@@ -36,8 +35,6 @@ from sklearn.model_selection import KFold, cross_val_score
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import seaborn as sns
-
-from statsmodels.stats.anova import anova_lm
 
 # Configuración global opcional para suprimir warnings estéticos
 warnings.filterwarnings("ignore")
@@ -162,7 +159,7 @@ def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_res
                         if orig_col in term:
                             factores_sig_set.add(inv_map.get(orig_col, orig_col))
 
-            # Gráfico 3D en modo Silencioso (Headless - Sin plt.show())
+            # Gráfico 3D en modo Silencioso (Headless)
             p_mains = {c: model_ols.pvalues[c] for c in cont_vars if c in model_ols.pvalues}
             if len(p_mains) >= 2:
                 top2 = sorted(p_mains, key=p_mains.get)[:2]
@@ -198,10 +195,10 @@ def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_res
                 plt.suptitle(f"Superficie RSM - {inv_map[resp]}", fontsize=12, fontweight='bold', y=0.95)
                 plt.subplots_adjust(wspace=0.15)
                 
-                # Guardado silencioso en disco
+                # Guardado silencioso en disco y liberación de memoria
                 nombre_archivo_fig = f"{ruta_graficas}/superficie_RSM_{inv_map[resp]}.png"
                 plt.savefig(nombre_archivo_fig, bbox_inches='tight', dpi=300)
-                plt.close(fig) # Cierra la figura para liberar memoria RAM y no congelar la ejecución
+                plt.close(fig) 
                 
         except Exception as e:
             print(f"  -> Error al ajustar el modelo OLS/ANOVA para {inv_map[resp]}: {e}")
@@ -213,61 +210,41 @@ def aislar_subconjunto_co2(datos_completos: pd.DataFrame, lista_respuestas: list
     Filtra dinámicamente un DSD para aislar los experimentos de CO2. Identifica 
     automáticamente los factores numéricos independientes para evaluar la pérdida de 
     ortogonalidad tras el particionamiento mediante el FIV interno.
-    
-    Argumentos:
-        datos_completos (pd.DataFrame): Dataset experimental original.
-        lista_respuestas (list): Lista de cadenas con los nombres de las respuestas dependientes.
-        
-    Retorna:
-        tuple: (datos_co2: pd.DataFrame, fiv_interno_ok: bool)
     """
-    # 1. Identificación dinámica de la columna Atmósfera (agnóstica a acentos y mayúsculas)
     col_atmosfera = next((col for col in datos_completos.columns 
                           if col.strip().lower() in ['atmósfera', 'atmosfera']), None)
     
     if col_atmosfera is None:
         raise ValueError("Error: No se encontró la columna de la atmósfera en el DataFrame.")
 
-    # 2. Particionamiento: Retener estrictamente registros de CO2
     mask_co2 = datos_completos[col_atmosfera].astype(str).str.contains('CO2', case=False, na=False)
     datos_co2 = datos_completos[mask_co2].copy()
     
-    # Validación matemática: El nuevo espacio vectorial debe ser un subconjunto estricto del original
     assert len(datos_co2) < len(datos_completos), "Fallo de aserción: El filtrado no redujo el tamaño del dataset."
     print(f"-> Subconjunto aislado exitosamente: {len(datos_co2)} experimentos bajo CO2.")
 
-    # 3. Limpieza: Eliminamos la variable categórica (ahora posee varianza cero)
     datos_co2.drop(columns=[col_atmosfera], inplace=True)
 
-    # 4. Identificación Dinámica de Factores Independientes (X)
-    # Regla: Cualquier columna que sea numérica (np.number) Y que no pertenezca a la lista de respuestas
     cols_numericas = datos_co2.select_dtypes(include=[np.number]).columns.tolist()
     factores_indep = [col for col in cols_numericas if col not in lista_respuestas]
     
     print(f"-> Factores continuos identificados dinámicamente: {len(factores_indep)}")
 
-    # 5. Evaluación de Ortogonalidad Estructural
     fiv_interno_ok = True
     if len(factores_indep) > 1:
-        # Calcular matriz de correlación de Pearson para el subconjunto
         matriz_corr = datos_co2[factores_indep].corr(method='pearson')
-        
-        # Preparar matriz de diseño X con un intercepto
         X = datos_co2[factores_indep].dropna()
         
         if not X.empty:
             X_with_const = add_constant(X)
-            
             try:
                 vifs = []
-                # Se itera desde 1 para omitir el análisis de colinealidad del intercepto
                 for i in range(1, X_with_const.shape[1]):
                     vif_val = variance_inflation_factor(X_with_const.values, i)
                     vifs.append(vif_val)
                 
                 fiv_max = np.nanmax(vifs)
                 
-                # Criterio de rechazo de ortogonalidad para el nuevo diseño espacial
                 if fiv_max > 5.0 or np.isinf(fiv_max):
                     msg = (f"Advertencia Estadística: Pérdida significativa de ortogonalidad al aislar el DSD. "
                            f"FIV interno máximo = {fiv_max:.2f} (> 5.0). "
@@ -278,29 +255,17 @@ def aislar_subconjunto_co2(datos_completos: pd.DataFrame, lista_respuestas: list
                     print(f"-> Ortogonalidad robusta preservada. FIV Interno Máximo: {fiv_max:.2f}")
                     
             except Exception as e:
-                # El cálculo de VIF puede fallar si la matriz es singular (varianza 0 en algún factor tras particionar)
                 print(f"-> Nota: No se pudo calcular el FIV (posible matriz singular o varianza 0 en un factor): {e}")
-                fiv_interno_ok = True  # Regla de salida: se considera "True" por falta de cálculo estadístico viable.
+                fiv_interno_ok = True
 
     return datos_co2, fiv_interno_ok
 
-def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respuestas: list, l1_ratio: float) -> list:
+def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respuestas: list, l1_ratio: float, ruta_graficas: str) -> list:
     """
     Aplica regularización Elastic Net mediante validación cruzada para realizar 
     reducción de dimensionalidad (Feature Selection). Filtra factores multicolineales 
     e irrelevantes, reteniendo solo aquellos con coeficientes distintos de cero.
-    
-    Argumentos:
-        datos_co2 (pd.DataFrame): Dataset filtrado exclusivamente bajo atmósfera de CO2.
-        factores_sig (list): Factores previamente identificados como significativos.
-        lista_respuestas (list): Nombres de las variables objetivo (Y).
-        l1_ratio (float): Proporción de penalización L1 (0 = Ridge puro, 1 = Lasso puro).
-        
-    Retorna:
-        list: Lista de factores robustos (únicos) con impacto real sobre las respuestas.
     """
-    # 1. Validación y filtrado de factores reales
-    # Ignoramos términos de interacción (ej. 'TIEMPO:ALTURA') que no existan como columnas físicas
     factores_validos = [factor for factor in factores_sig if factor in datos_co2.columns]
     
     if not factores_validos:
@@ -309,7 +274,6 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
     print(f"\n--- FASE 3: REDUCCIÓN DE DIMENSIONALIDAD (ELASTIC NET | L1_RATIO = {l1_ratio}) ---")
     print(f"-> Factores de entrada a la regularización: {len(factores_validos)}")
     
-    # 2. Configuración estética JCR Q1 para los gráficos
     plt.rcParams.update({
         'font.family': 'serif', 'font.serif': ['Times New Roman'],
         'axes.labelsize': 10, 'axes.titlesize': 12,
@@ -317,44 +281,34 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
         'figure.dpi': 300
     })
 
-    # 3. Preparación de la Matriz de Características (X)
     X = datos_co2[factores_validos]
-    
-    # Estandarización de X (Crucial para algoritmos regularizados basados en gradiente/distancia)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
     variables_limpias = []
 
-    # 4. Bucle iterativo sobre cada variable de respuesta
     for resp in lista_respuestas:
         if resp not in datos_co2.columns:
             continue
             
-        # Definición del vector objetivo (y)
         y = datos_co2[resp]
-        
-        # Sincronización de índices en caso de que existan valores nulos (NaN)
         mascara_validos = y.notna()
         X_curr = X_scaled[mascara_validos]
         y_curr = y[mascara_validos]
         
-        # Ignorar respuestas sin varianza (constantes) o con muy pocos datos
         if len(y_curr) < 10 or np.var(y_curr) == 0:
             print(f"  -> Omitiendo '{resp}': Varianza cero o datos insuficientes para CV.")
             continue
 
         try:
-            # 5. Ajuste del Modelo ElasticNet con Cross-Validation (cv=5)
             with warnings.catch_warnings():
-                warnings.simplefilter("ignore") # Suprimir warnings de convergencia
+                warnings.simplefilter("ignore")
                 modelo_enet = ElasticNetCV(l1_ratio=l1_ratio, cv=5, random_state=42, n_jobs=-1)
                 modelo_enet.fit(X_curr, y_curr)
         except Exception as e:
             print(f"  -> Error al ajustar ElasticNet para '{resp}': {e}")
             continue
 
-        # 6. Extracción de Coeficientes y Filtrado
         coeficientes = modelo_enet.coef_
         indices_no_cero = np.where(np.abs(coeficientes) > 0)[0]
         
@@ -362,55 +316,47 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
             factores_retenidos = [factores_validos[i] for i in indices_no_cero]
             variables_limpias.extend(factores_retenidos)
             
-            # Preparación de datos para el gráfico
             coefs_grafico = coeficientes[indices_no_cero]
             df_plot = pd.DataFrame({
                 'Factor': factores_retenidos,
                 'Coeficiente': coefs_grafico
             }).sort_values(by='Coeficiente', key=abs, ascending=False)
             
-            # 7. Renderizado del Gráfico de Barras JCR
-            plt.figure(figsize=(8, 4))
-            # Usamos 'hue' con leyenda desactivada para mantener estética moderna en Seaborn
-            sns.barplot(data=df_plot, x='Coeficiente', y='Factor', 
-                        palette='viridis', hue='Factor', dodge=False, legend=False)
+            # Asignación explícita de figura para Headless mode
+            fig = plt.figure(figsize=(8, 4))
+            
+            # Fix de Seaborn: Asignar a 'ax' y remover leyenda de forma segura
+            ax = sns.barplot(data=df_plot, x='Coeficiente', y='Factor', 
+                             palette='viridis', hue='Factor', dodge=False)
+            if ax.get_legend() is not None:
+                ax.get_legend().remove()
             
             plt.title(f"Pesos Predictivos (Elastic Net) - {resp}", fontweight='bold', pad=10)
             plt.axvline(0, color='black', linewidth=1.2, linestyle='--')
             plt.xlabel("Magnitud del Coeficiente Estandarizado")
             plt.ylabel("")
             plt.tight_layout()
-            plt.savefig(f"resultados_dsd/graficas/nombre_del_grafico.png", bbox_inches='tight', dpi=300)
+            
+            # Guardado dinámico y liberación de memoria
+            plt.savefig(f"{ruta_graficas}/ElasticNet_{resp}.png", bbox_inches='tight', dpi=300)
             plt.close(fig)
         else:
             print(f"  -> [{resp}]: Todos los factores fueron fuertemente penalizados a cero.")
 
-    # 8. Consolidación de variables únicas y Validación Lógica
     variables_limpias_unicas = list(set(variables_limpias))
-    
-    assert len(variables_limpias_unicas) > 0, "ElasticNet penalizó todas las variables a cero. El bucle principal deberá relajar los parámetros (ej. disminuir l1_ratio o aumentar alpha)."
+    assert len(variables_limpias_unicas) > 0, "ElasticNet penalizó todas las variables a cero. El bucle principal deberá relajar los parámetros."
     
     print(f"\n-> Elastic Net completado. Factores que sobrevivieron a la regularización ({len(variables_limpias_unicas)}):")
     print(variables_limpias_unicas)
     
     return variables_limpias_unicas
 
-def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respuestas: list) -> tuple:
-
+def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respuestas: list, ruta_graficas: str) -> tuple:
     """
     Entrena un motor predictivo no lineal basado en Procesos Gaussianos (GPR) para 
     cada variable de respuesta. Aplica validación cruzada para cuantificar el error 
     y genera Gráficos de Dependencia Parcial (1D) con bandas de incertidumbre (95%).
-    
-    Argumentos:
-        datos_co2 (pd.DataFrame): Dataset operativo (filtrado para CO2).
-        variables_limpias (list): Factores independientes seleccionados por Elastic Net.
-        lista_respuestas (list): Lista de variables objetivo (Y).
-        
-    Retorna:
-        tuple: (modelos_gpr: dict, ecm_cv_promedio: float)
     """
-    # 1. Validación estricta de la información de entrada
     if not variables_limpias:
         raise ValueError("Error crítico: La lista 'variables_limpias' está vacía. El GPR no tiene predictores.")
         
@@ -420,7 +366,6 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
         
     print("\n--- FASE 4: ENTRENAMIENTO DE PROCESOS GAUSSIANOS (GPR) Y CUANTIFICACIÓN DE INCERTIDUMBRE ---")
 
-    # 2. Configuración estética JCR Q1
     plt.rcParams.update({
         'font.family': 'serif', 'font.serif': ['Times New Roman'],
         'axes.labelsize': 10, 'axes.titlesize': 12,
@@ -428,63 +373,49 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
         'figure.dpi': 300
     })
 
-    # 3. Inicialización de estructuras de datos
     modelos_gpr = {}
     ecm_list = []
-    
-    # 4. Extracción de Matriz de Características Original (X)
     X = datos_co2[variables_limpias]
 
-    # 5. Iteración sobre las respuestas
     for resp in lista_respuestas:
         if resp not in datos_co2.columns:
             continue
             
         y = datos_co2[resp]
-        
-        # Sincronización de índices (evitar NaNs)
         mascara = y.notna()
         X_valido = X[mascara]
-        y_valido = y[mascara].values.reshape(-1, 1) # Scikit-learn espera 2D para estandarizar Y
+        y_valido = y[mascara].values.reshape(-1, 1)
         
         if len(y_valido) < 10 or np.var(y_valido) == 0:
             print(f"  -> Omitiendo '{resp}': Varianza cero o datos insuficientes.")
             continue
             
-        # 6. Estandarización interna (Crítico para la convergencia del kernel Matern)
         scaler_X = StandardScaler()
         scaler_y = StandardScaler()
         
         X_scaled = scaler_X.fit_transform(X_valido)
-        y_scaled = scaler_y.fit_transform(y_valido).ravel() # El GPR requiere 1D en fit
+        y_scaled = scaler_y.fit_transform(y_valido).ravel()
 
-        # 7. Configuración del Kernel Híbrido y el GPR
-        # Matern(2.5) modela superficies físicas fluidas. WhiteKernel absorbe el ruido experimental.
         kernel = Matern(nu=2.5) + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-5, 1e1))
         
         gpr = GaussianProcessRegressor(
             kernel=kernel, 
-            n_restarts_optimizer=10, # Reinicios múltiples para evitar mínimos locales en la maximización de la log-verosimilitud
+            n_restarts_optimizer=10,
             random_state=42
         )
 
-        # 8. Validación Cruzada (KFold, n_splits=5)
-        # Suprimimos warnings de convergencia del GPR durante los folds de CV
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             cv = KFold(n_splits=5, shuffle=True, random_state=42)
-            # neg_mean_squared_error devuelve valores negativos, tomamos valor absoluto
             scores_cv = cross_val_score(gpr, X_scaled, y_scaled, cv=cv, scoring='neg_mean_squared_error')
             
         ecm_respuesta = np.abs(scores_cv.mean())
         ecm_list.append(ecm_respuesta)
         
-        # 9. Entrenamiento del modelo final con el 100% de los datos
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             gpr.fit(X_scaled, y_scaled)
             
-        # Almacenamiento del pipeline completo para esta respuesta
         modelos_gpr[resp] = {
             'modelo': gpr,
             'scaler_X': scaler_X,
@@ -494,39 +425,28 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
         
         print(f"  -> [{resp}] GPR Entrenado | ECM (CV Estandarizado): {ecm_respuesta:.4f}")
 
-        # 10. Generación de Gráficos de Dependencia Parcial (1D) con Incertidumbre
-        # Seleccionamos las 2 variables más influyentes (asumimos las 2 primeras de la lista limpiada)
         top_2_vars = variables_limpias[:2] if len(variables_limpias) >= 2 else variables_limpias
         
+        # Asignación explícita de figura y ejes para Headless mode
         fig, axes = plt.subplots(1, len(top_2_vars), figsize=(6 * len(top_2_vars), 4.5))
-        if len(top_2_vars) == 1: axes = [axes] # Asegurar iterabilidad
+        if len(top_2_vars) == 1: axes = [axes]
         
         for ax, feature_name in zip(axes, top_2_vars):
             idx_feature = variables_limpias.index(feature_name)
             
-            # Crear espacio sintético 1D en escala estandarizada
             x_synth = np.linspace(X_scaled[:, idx_feature].min(), X_scaled[:, idx_feature].max(), 100)
-            X_test_scaled = np.zeros((100, len(variables_limpias))) # Los demás factores se quedan en su media (0)
+            X_test_scaled = np.zeros((100, len(variables_limpias)))
             X_test_scaled[:, idx_feature] = x_synth
             
-            # Predicción Probabilística
-            # CRÍTICO: return_std=True habilita el framework Bayesiano del GPR
             mean_scaled, std_scaled = gpr.predict(X_test_scaled, return_std=True)
-            
-            # Asegurar mapeo espacial 1:1 de incertidumbre
             assert len(std_scaled) == len(mean_scaled), "Fallo de dimensión: Mismatch entre media y desviación estándar."
             
-            # Decodificación (Inversión) a unidades físicas reales para el gráfico
             mean_real = scaler_y.inverse_transform(mean_scaled.reshape(-1, 1)).flatten()
-            # La desviación estándar solo se multiplica por la escala (no se le suma el offset/media)
             std_real = std_scaled * scaler_y.scale_[0] 
             
             x_real = scaler_X.inverse_transform(X_test_scaled)[:, idx_feature]
             
-            # Dibujar la línea de tendencia central
             ax.plot(x_real, mean_real, 'b-', label='Predicción (Media)', linewidth=2)
-            
-            # Dibujar la banda de incertidumbre del 95% (Z = 1.96)
             ax.fill_between(
                 x_real, 
                 mean_real - 1.96 * std_real, 
@@ -534,7 +454,6 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
                 color='blue', alpha=0.2, label='95% Intervalo Confianza'
             )
             
-            # Estética de nivel publicación
             ax.set_title(f"Efecto Aislado: {feature_name}", fontweight='bold')
             ax.set_xlabel(feature_name)
             ax.set_ylabel(f"{resp} (Unidades Reales)")
@@ -543,17 +462,23 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
 
         plt.suptitle(f"Dependencia Parcial GPR - {resp}", fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
-        plt.savefig(f"resultados_dsd/graficas/nombre_del_grafico.png", bbox_inches='tight', dpi=300)
+        
+        # Guardado dinámico y liberación de memoria
+        plt.savefig(f"{ruta_graficas}/GPR_{resp}.png", bbox_inches='tight', dpi=300)
         plt.close(fig)
 
-    # 11. Cálculo de métrica global
     ecm_cv_promedio = float(np.mean(ecm_list)) if ecm_list else np.nan
     print(f"\n-> Entrenamiento finalizado. ECM Promedio Global (Escala Std): {ecm_cv_promedio:.4f}")
     
     return modelos_gpr, ecm_cv_promedio
 
 def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: list, diccionario_respuestas: dict) -> tuple:
-    print("\n--- FASE 4: OPTIMIZACIÓN BAYESIANA MULTIOBJETIVO Y TOPOLOGÍA ---")
+    """
+    Motor de Optimización Bayesiana para buscar las condiciones operativas ideales.
+    Utiliza Differential Evolution sobre la función de adquisición LCB del espacio 
+    probabilístico modelado por Procesos Gaussianos.
+    """
+    print("\n--- FASE 5: OPTIMIZACIÓN BAYESIANA MULTIOBJETIVO Y TOPOLOGÍA ---")
     
     if not modelos_gpr:
         raise ValueError("Error: El diccionario de modelos GPR está vacío.")
