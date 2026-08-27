@@ -37,184 +37,176 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import seaborn as sns
 
+from statsmodels.stats.anova import anova_lm
+
 # Configuración global opcional para suprimir warnings estéticos
 warnings.filterwarnings("ignore")
 # ---------------------------------------
 
 def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_respuestas: list, ruta_tablas: str, ruta_graficas: str) -> tuple:
     """
-    Ajusta un modelo de Superficie de Respuesta (RSM) global para cada variable dependiente.
-    Genera y exporta la tabla ANOVA, valida los supuestos de los residuos (Shapiro, Breusch-Pagan), 
-    calcula la multicolinealidad (FIV) y exporta silenciosamente gráficos de superficie 3D.
-    
-    Argumentos:
-        datos_completos (pd.DataFrame): Dataset completo (DSD).
-        alpha (float): Nivel de significancia (ej. 0.05).
-        lista_respuestas (list): Nombres de las columnas de respuesta (Y).
-        ruta_tablas (str): Directorio donde se guardarán los archivos .csv del ANOVA.
-        ruta_graficas (str): Directorio donde se guardarán los gráficos .png.
-        
-    Retorna:
-        tuple: (factores_sig: list, residuos_ok: bool)
+    Ejecuta un análisis RSM, calcula FIV, normalidad, homocedasticidad,
+    exporta tablas ANOVA a CSV y guarda gráficos 3D en silencio (Headless).
     """
-    # 1. Validación inicial estricta
     assert not datos_completos.empty, "Error: El DataFrame de entrada está vacío."
+    warnings.filterwarnings("ignore")
     
-    # Asegurar que los directorios de salida existan
-    os.makedirs(ruta_tablas, exist_ok=True)
-    os.makedirs(ruta_graficas, exist_ok=True)
-    
-    # 2. Configuración estética JCR Q1 para exportación de gráficos
+    # Configuración JCR Q1 en modo silencioso
     plt.rcParams.update({
         'font.family': 'serif', 'font.serif': ['Times New Roman'],
-        'axes.labelsize': 10, 'axes.titlesize': 12,
-        'xtick.labelsize': 9, 'ytick.labelsize': 9,
+        'axes.labelsize': 10, 'axes.titlesize': 11,
+        'xtick.labelsize': 8, 'ytick.labelsize': 8,
         'figure.dpi': 300
     })
 
-    # 3. Identificación de Factores (X) y Manejo de Categórica
-    # Tolerancia a variaciones en el nombre de la Atmósfera
-    cat_original = next((col for col in datos_completos.columns if col.strip().lower() in ['atmósfera', 'ATMOSFERA']), None)
-    if not cat_original:
-        raise ValueError("No se encontró la columna de la atmósfera en el dataset.")
-        
-    factores_continuos = [col for col in datos_completos.columns 
-                          if col not in lista_respuestas and col != cat_original]
+    def clean_name(name):
+        return re.sub(r'_+', '_', re.sub(r'[^a-zA-Z0-9_]', '_', str(name))).strip('_')
     
-    # 4. Saneamiento de Nombres (Requerido por smf.ols para evitar fallos de sintaxis)
-    def sanitize_str(s): 
-        return re.sub(r'\W+', '_', s).strip('_')
+    col_map = {col: clean_name(col) for col in datos_completos.columns}
+    inv_map = {v: k for k, v in col_map.items()}
     
-    name_map = {col: sanitize_str(col) for col in datos_completos.columns}
-    inv_map = {v: k for k, v in name_map.items()}
+    df_clean = datos_completos.rename(columns=col_map)
+    resp_clean = [col_map[r] for r in lista_respuestas if r in col_map]
     
-    df_clean = datos_completos.copy()
-    df_clean.columns = [name_map[col] for col in datos_completos.columns]
+    cat_var = col_map.get('Atmósfera', 'Atmósfera')
+    cont_vars = [c for c in df_clean.columns if c not in resp_clean and c != cat_var]
+
+    df_coded = df_clean.copy()
     
-    # Asegurar tipología estricta de la variable categórica
-    cat_var = name_map[cat_original]
-    df_clean[cat_var] = df_clean[cat_var].astype(str).str.strip().str.capitalize() # 'Argón', 'Co2'
+    if cat_var in df_coded.columns:
+        df_coded[cat_var] = np.where(df_coded[cat_var].astype(str).str.upper().str.contains('CO2'), 1, -1)
     
-    cont_vars = [name_map[c] for c in factores_continuos]
-    resp_vars = [name_map[r] for r in lista_respuestas]
-    
+    scale_params = {}
+    for col in cont_vars:
+        if df_clean[col].dtype == object or df_clean[col].dtype.name == 'category':
+            levels = df_clean[col].unique()
+            df_coded[col] = np.where(df_clean[col] == levels[0], -1, 1)
+        else:
+            min_v, max_v = df_clean[col].min(), df_clean[col].max()
+            scale_params[col] = (min_v, max_v)
+            df_coded[col] = 2 * (df_clean[col] - min_v) / (max_v - min_v) - 1 if max_v > min_v else 0
+
+    def map_to_coded(val_array, min_v, max_v):
+        return 2 * (val_array - min_v) / (max_v - min_v) - 1
+
+    def _stepwise_heredity(response, data):
+        included = []
+        all_factors = [cat_var] + cont_vars
+        while True:
+            changed = False
+            valid_mains = [m for m in all_factors if m not in included]
+            valid_inters = [f"{included[i]}:{included[j]}" for i in range(len(included)) 
+                            for j in range(i+1, len(included))]
+            valid_quads = [f"I({f}**2)" for f in included if f in cont_vars]
+            
+            valid_inters = [t for t in valid_inters if t not in included and f"{t.split(':')[1]}:{t.split(':')[0]}" not in included]
+            valid_quads = [q for q in valid_quads if q not in included]
+            
+            candidates = valid_mains + valid_inters + valid_quads
+            
+            best_pval, best_candidate = 1.0, None
+            for candidate in candidates:
+                formula = f"{response} ~ " + " + ".join(included + [candidate]) if included else f"{response} ~ {candidate}"
+                try:
+                    pval = smf.ols(formula, data).fit().pvalues.get(candidate, 1.0)
+                    if pval < best_pval:
+                        best_pval, best_candidate = pval, candidate
+                except: pass
+                
+            if best_pval < alpha:
+                included.append(best_candidate)
+                changed = True
+                
+            formula = f"{response} ~ " + " + ".join(included) if included else f"{response} ~ 1"
+            try:
+                pvalues = smf.ols(formula, data).fit().pvalues.drop('Intercept', errors='ignore')
+                if not pvalues.empty and pvalues.max() > alpha:
+                    included.remove(pvalues.idxmax())
+                    changed = True
+            except: pass
+                
+            if not changed: break
+        return included
+
     factores_sig_set = set()
     residuos_ok = True
 
-    # 5. Iteración de Modelado sobre cada Respuesta
-    for resp in resp_vars:
-        resp_original = inv_map[resp]
-        # Crear un nombre seguro para los archivos exportados (evita fallos por '/' o '%' en nombres)
-        safe_filename = sanitize_str(resp_original)
-        
-        print(f"\n[{resp_original}] Modelando Superficie de Respuesta (RSM)...")
-        
-        # Construcción de la Ecuación del Modelo RSM (Principales + Cuadráticos + Interacciones)
-        main_eff = " + ".join(cont_vars)
-        quad_eff = " + ".join([f"I({c}**2)" for c in cont_vars])
-        inter_eff = " + ".join([f"{cont_vars[i]}:{cont_vars[j]}" 
-                                for i in range(len(cont_vars)) for j in range(i+1, len(cont_vars))])
-        
-        formula = f"{resp} ~ C({cat_var}) + {main_eff} + {quad_eff} + {inter_eff}"
-        
+    for resp in resp_clean:
+        print(f"\n[{inv_map[resp]}] Modelando Superficie de Respuesta (RSM)...")
         try:
-            model = smf.ols(formula, data=df_clean).fit()
+            selected_terms = _stepwise_heredity(resp, df_coded)
+            if not selected_terms:
+                continue
+                
+            formula_final = f"{resp} ~ " + " + ".join(selected_terms)
+            model_ols = smf.ols(formula=formula_final, data=df_coded).fit()
             
-            # --- 6. Tabla ANOVA Formal ---
-            # typ=2 evalúa el efecto marginal de cada variable
-            tabla_anova = anova_lm(model, typ=2)
-            ruta_csv = os.path.join(ruta_tablas, f"anova_{safe_filename}.csv")
-            tabla_anova.to_csv(ruta_csv)
-            print(f"  -> Tabla ANOVA exportada: {ruta_csv}")
+            # --- EXPORTACIÓN DE TABLA ANOVA A CSV ---
+            tabla_anova = anova_lm(model_ols, typ=2)
+            tabla_anova.to_csv(f"{ruta_tablas}/anova_{inv_map[resp]}.csv")
             
-        except Exception as e:
-            print(f"  -> Error al ajustar el modelo OLS/ANOVA para {resp_original}: {e}")
-            continue
-
-        # --- 7. Cálculo de FIV ---
-        exog = model.model.exog
-        vifs = []
-        for i in range(1, exog.shape[1]): # Ignorar el Intercepto
+            # Validación Estadística
+            p_shapiro = shapiro(model_ols.resid)[1]
             try:
-                vifs.append(variance_inflation_factor(exog, i))
-            except: pass
-        max_vif = np.nanmax(vifs) if vifs else np.nan
-        print(f"  -> FIV Máximo de la matriz de diseño: {max_vif:.2f}")
-
-        # --- 8. Validación de Supuestos de Residuos ---
-        p_shapiro = shapiro(model.resid)[1]
-        try:
-            p_bp = het_breuschpagan(model.resid, exog)[1]
-        except:
-            p_bp = np.nan
-            
-        print(f"  -> p-valor Shapiro-Wilk (Normalidad): {p_shapiro:.4f}")
-        print(f"  -> p-valor Breusch-Pagan (Homocedasticidad): {p_bp:.4f}")
-        
-        # Si alguna de las pruebas falla el alpha, flag se vuelve False
-        if p_shapiro < alpha or (not np.isnan(p_bp) and p_bp < alpha):
-            residuos_ok = False
-
-        # --- 9. Recolección de Factores Significativos ---
-        pvalues = model.pvalues
-        for term, pval in pvalues.items():
-            if pval < alpha and term != 'Intercept':
-                # Decodificar el nombre de la variable al formato original
-                for raw, clean in name_map.items():
-                    if clean in term and raw not in lista_respuestas:
-                        factores_sig_set.add(raw)
-
-        # --- 10. Graficación Silenciosa 3D ---
-        # Extraer los 2 factores continuos con mayor significancia (menor p-value)
-        p_mains = {c: pvalues[c] for c in cont_vars if c in pvalues}
-        if len(p_mains) >= 2:
-            top2 = sorted(p_mains, key=p_mains.get)[:2]
-            f_x, f_y = top2[0], top2[1]
-            
-            fig = plt.figure(figsize=(14, 6))
-            atm_levels = ['Argón', 'Co2']
-            cmaps = ['viridis', 'plasma']
-            
-            x_range = np.linspace(df_clean[f_x].min(), df_clean[f_x].max(), 30)
-            y_range = np.linspace(df_clean[f_y].min(), df_clean[f_y].max(), 30)
-            X_grid, Y_grid = np.meshgrid(x_range, y_range)
-            
-            for i, atm in enumerate(atm_levels):
-                pred_df = pd.DataFrame({
-                    f_x: X_grid.ravel(),
-                    f_y: Y_grid.ravel(),
-                    cat_var: atm
-                })
-                # El resto de los predictores se fijan en su mediana
-                for f in cont_vars:
-                    if f not in [f_x, f_y]:
-                        pred_df[f] = df_clean[f].median()
-                        
-                Z_pred = model.predict(pred_df).values.reshape(X_grid.shape)
+                p_bp = het_breuschpagan(model_ols.resid, model_ols.model.exog)[1]
+            except:
+                p_bp = np.nan
                 
-                ax = fig.add_subplot(1, 2, i+1, projection='3d')
-                surf = ax.plot_surface(X_grid, Y_grid, Z_pred, cmap=cmaps[i], 
-                                       edgecolor='none', alpha=0.9, antialiased=True)
+            if p_shapiro < 0.05 or p_bp < 0.05:
+                residuos_ok = False
+
+            # Extracción de factores significativos
+            for term, pval in model_ols.pvalues.items():
+                if pval < alpha and term != 'Intercept':
+                    for orig_col in cont_vars + [cat_var]:
+                        if orig_col in term:
+                            factores_sig_set.add(inv_map.get(orig_col, orig_col))
+
+            # Gráfico 3D en modo Silencioso (Headless - Sin plt.show())
+            p_mains = {c: model_ols.pvalues[c] for c in cont_vars if c in model_ols.pvalues}
+            if len(p_mains) >= 2:
+                top2 = sorted(p_mains, key=p_mains.get)[:2]
+                f_x, f_y = top2[0], top2[1]
                 
-                ax.set_title(f"Atmósfera: {atm.upper()}", fontweight='bold', pad=10)
-                ax.set_xlabel(inv_map[f_x], labelpad=10)
-                ax.set_ylabel(inv_map[f_y], labelpad=10)
-                ax.set_zlabel(resp_original, labelpad=10)
-                ax.view_init(elev=25, azim=135)
-                fig.colorbar(surf, ax=ax, shrink=0.5, aspect=12, pad=0.1)
+                fig = plt.figure(figsize=(12, 5))
+                x_real = np.linspace(df_clean[f_x].min(), df_clean[f_x].max(), 35)
+                y_real = np.linspace(df_clean[f_y].min(), df_clean[f_y].max(), 35)
+                X_grid_real, Y_grid_real = np.meshgrid(x_real, y_real)
 
-            plt.suptitle(f"Superficie de Respuesta RSM - Variable: {resp_original}", 
-                         fontsize=14, fontweight='bold', y=0.95)
-            plt.subplots_adjust(wspace=0.2)
-            
-            # Guardado Silencioso y liberación de memoria RAM
-            ruta_img = os.path.join(ruta_graficas, f"superficie_RSM_{safe_filename}.png")
-            plt.savefig(ruta_img, bbox_inches='tight', dpi=300)
-            plt.close(fig)
-            print(f"  -> Gráfico RSM exportado silenciosamente: {ruta_img}")
+                for i, (atm_str, atm_coded) in enumerate([('Argón', -1), ('CO2', 1)]):
+                    pred_coded = pd.DataFrame({
+                        f_x: map_to_coded(X_grid_real.ravel(), *scale_params[f_x]),
+                        f_y: map_to_coded(Y_grid_real.ravel(), *scale_params[f_y]),
+                        cat_var: atm_coded
+                    })
+                    for f in cont_vars:
+                        if f not in [f_x, f_y]: pred_coded[f] = 0.0
+                            
+                    Z_pred = model_ols.predict(pred_coded).values.reshape(X_grid_real.shape)
+                    
+                    ax = fig.add_subplot(1, 2, i+1, projection='3d')
+                    surf = ax.plot_surface(X_grid_real, Y_grid_real, Z_pred, cmap=['viridis', 'plasma'][i], 
+                                           edgecolor='none', alpha=0.85)
+                    
+                    ax.set_title(f"Atmósfera: {atm_str}", fontweight='bold', pad=10)
+                    ax.set_xlabel(inv_map.get(f_x, f_x), labelpad=10)
+                    ax.set_ylabel(inv_map.get(f_y, f_y), labelpad=10)
+                    ax.set_zlabel(inv_map.get(resp, resp), labelpad=10)
+                    ax.view_init(elev=20, azim=135)
+                    fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, pad=0.1)
 
-    factores_sig = list(factores_sig_set)
-    return factores_sig, residuos_ok
+                plt.suptitle(f"Superficie RSM - {inv_map[resp]}", fontsize=12, fontweight='bold', y=0.95)
+                plt.subplots_adjust(wspace=0.15)
+                
+                # Guardado silencioso en disco
+                nombre_archivo_fig = f"{ruta_graficas}/superficie_RSM_{inv_map[resp]}.png"
+                plt.savefig(nombre_archivo_fig, bbox_inches='tight', dpi=300)
+                plt.close(fig) # Cierra la figura para liberar memoria RAM y no congelar la ejecución
+                
+        except Exception as e:
+            print(f"  -> Error al ajustar el modelo OLS/ANOVA para {inv_map[resp]}: {e}")
+
+    return list(factores_sig_set), residuos_ok
 
 def aislar_subconjunto_co2(datos_completos: pd.DataFrame, lista_respuestas: list) -> tuple:
     """
