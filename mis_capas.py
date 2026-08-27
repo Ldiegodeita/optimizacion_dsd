@@ -17,7 +17,7 @@ import statsmodels.formula.api as smf
 from statsmodels.tools.tools import add_constant
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.stats.diagnostic import het_breuschpagan
-from statsmodels.stats.anova import anova_lm  # Importación explícita asegurada
+from statsmodels.stats.anova import anova_lm
 
 # 4. Computación Científica y Optimización (SciPy)
 from scipy.stats import shapiro
@@ -25,30 +25,31 @@ from scipy.optimize import differential_evolution
 from scipy.special import expit
 
 # 5. Machine Learning y Feature Selection (Scikit-Learn)
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, PowerTransformer, PolynomialFeatures
 from sklearn.linear_model import ElasticNetCV
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.model_selection import KFold, cross_val_score
 
-# 6. Visualización Científica (Matplotlib & Seaborn)
+# 6. Visualización Científica y Multimedia (Matplotlib, Seaborn, PIL)
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import seaborn as sns
+from PIL import Image
 
 # Configuración global opcional para suprimir warnings estéticos
 warnings.filterwarnings("ignore")
 # ---------------------------------------
 
-def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_respuestas: list, ruta_tablas: str, ruta_graficas: str) -> tuple:
+def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_respuestas: list, ruta_tablas: str, ruta_graficas: str, iteracion: int) -> tuple:
     """
-    Ejecuta un análisis RSM, calcula FIV, normalidad, homocedasticidad,
-    exporta tablas ANOVA a CSV y guarda gráficos 3D en silencio (Headless).
+    Ejecuta un análisis RSM Global (OLS completo sin Stepwise) para evaluar 
+    la varianza base, exportar la tabla ANOVA completa y generar gráficos 3D iniciales.
+    Retorna la lista completa de factores continuos originales.
     """
     assert not datos_completos.empty, "Error: El DataFrame de entrada está vacío."
     warnings.filterwarnings("ignore")
     
-    # Configuración JCR Q1 en modo silencioso
     plt.rcParams.update({
         'font.family': 'serif', 'font.serif': ['Times New Roman'],
         'axes.labelsize': 10, 'axes.titlesize': 11,
@@ -86,63 +87,24 @@ def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_res
     def map_to_coded(val_array, min_v, max_v):
         return 2 * (val_array - min_v) / (max_v - min_v) - 1
 
-    def _stepwise_heredity(response, data):
-        included = []
-        all_factors = [cat_var] + cont_vars
-        while True:
-            changed = False
-            valid_mains = [m for m in all_factors if m not in included]
-            valid_inters = [f"{included[i]}:{included[j]}" for i in range(len(included)) 
-                            for j in range(i+1, len(included))]
-            valid_quads = [f"I({f}**2)" for f in included if f in cont_vars]
-            
-            valid_inters = [t for t in valid_inters if t not in included and f"{t.split(':')[1]}:{t.split(':')[0]}" not in included]
-            valid_quads = [q for q in valid_quads if q not in included]
-            
-            candidates = valid_mains + valid_inters + valid_quads
-            
-            best_pval, best_candidate = 1.0, None
-            for candidate in candidates:
-                formula = f"{response} ~ " + " + ".join(included + [candidate]) if included else f"{response} ~ {candidate}"
-                try:
-                    pval = smf.ols(formula, data).fit().pvalues.get(candidate, 1.0)
-                    if pval < best_pval:
-                        best_pval, best_candidate = pval, candidate
-                except: pass
-                
-            if best_pval < alpha:
-                included.append(best_candidate)
-                changed = True
-                
-            formula = f"{response} ~ " + " + ".join(included) if included else f"{response} ~ 1"
-            try:
-                pvalues = smf.ols(formula, data).fit().pvalues.drop('Intercept', errors='ignore')
-                if not pvalues.empty and pvalues.max() > alpha:
-                    included.remove(pvalues.idxmax())
-                    changed = True
-            except: pass
-                
-            if not changed: break
-        return included
-
-    factores_sig_set = set()
     residuos_ok = True
 
     for resp in resp_clean:
-        print(f"\n[{inv_map[resp]}] Modelando Superficie de Respuesta (RSM)...")
+        print(f"\n[{inv_map[resp]}] Ajustando Modelo OLS Global (RSM Completo)...")
         try:
-            selected_terms = _stepwise_heredity(resp, df_coded)
-            if not selected_terms:
-                continue
-                
-            formula_final = f"{resp} ~ " + " + ".join(selected_terms)
+            # Construcción de la fórmula RSM completa (Principales + Cuadráticos + Interacciones)
+            main_eff = " + ".join(cont_vars)
+            quad_eff = " + ".join([f"I({c}**2)" for c in cont_vars])
+            inter_eff = " + ".join([f"{cont_vars[i]}:{cont_vars[j]}" for i in range(len(cont_vars)) for j in range(i+1, len(cont_vars))])
+            
+            formula_final = f"{resp} ~ {cat_var} + {main_eff} + {quad_eff} + {inter_eff}"
             model_ols = smf.ols(formula=formula_final, data=df_coded).fit()
             
-            # --- EXPORTACIÓN DE TABLA ANOVA A CSV ---
+            # Exportación de la tabla ANOVA completa
             tabla_anova = anova_lm(model_ols, typ=2)
-            tabla_anova.to_csv(f"{ruta_tablas}/anova_{inv_map[resp]}.csv")
+            tabla_anova.to_csv(f"{ruta_tablas}/anova_completo_{inv_map[resp]}.csv")
             
-            # Validación Estadística
+            # Validación Estadística de Residuos Globales
             p_shapiro = shapiro(model_ols.resid)[1]
             try:
                 p_bp = het_breuschpagan(model_ols.resid, model_ols.model.exog)[1]
@@ -152,14 +114,7 @@ def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_res
             if p_shapiro < 0.05 or p_bp < 0.05:
                 residuos_ok = False
 
-            # Extracción de factores significativos
-            for term, pval in model_ols.pvalues.items():
-                if pval < alpha and term != 'Intercept':
-                    for orig_col in cont_vars + [cat_var]:
-                        if orig_col in term:
-                            factores_sig_set.add(inv_map.get(orig_col, orig_col))
-
-            # Gráfico 3D en modo Silencioso (Headless)
+            # Gráfico 3D ilustrativo (usando los 2 factores continuos con menor p-value en el modelo global)
             p_mains = {c: model_ols.pvalues[c] for c in cont_vars if c in model_ols.pvalues}
             if len(p_mains) >= 2:
                 top2 = sorted(p_mains, key=p_mains.get)[:2]
@@ -192,24 +147,23 @@ def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_res
                     ax.view_init(elev=20, azim=135)
                     fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, pad=0.1)
 
-                plt.suptitle(f"Superficie RSM - {inv_map[resp]}", fontsize=12, fontweight='bold', y=0.95)
+                plt.suptitle(f"Superficie RSM Global - {inv_map[resp]} (Iter: {iteracion})", fontsize=12, fontweight='bold', y=0.95)
                 plt.subplots_adjust(wspace=0.15)
                 
-                # Guardado silencioso en disco y liberación de memoria
-                nombre_archivo_fig = f"{ruta_graficas}/superficie_RSM_{inv_map[resp]}.png"
+                nombre_archivo_fig = f"{ruta_graficas}/superficie_RSM_{inv_map[resp]}_iter_{iteracion}.png"
                 plt.savefig(nombre_archivo_fig, bbox_inches='tight', dpi=300)
                 plt.close(fig) 
                 
         except Exception as e:
             print(f"  -> Error al ajustar el modelo OLS/ANOVA para {inv_map[resp]}: {e}")
 
-    return list(factores_sig_set), residuos_ok
+    # Retornamos la lista completa de factores originales (factores madre)
+    factores_continuos_originales = [inv_map.get(c, c) for c in cont_vars]
+    return factores_continuos_originales, residuos_ok
 
 def aislar_subconjunto_co2(datos_completos: pd.DataFrame, lista_respuestas: list) -> tuple:
     """
-    Filtra dinámicamente un DSD para aislar los experimentos de CO2. Identifica 
-    automáticamente los factores numéricos independientes para evaluar la pérdida de 
-    ortogonalidad tras el particionamiento mediante el FIV interno.
+    Filtra dinámicamente un DSD para aislar los experimentos de CO2 y evalúa ortogonalidad.
     """
     col_atmosfera = next((col for col in datos_completos.columns 
                           if col.strip().lower() in ['atmósfera', 'atmosfera']), None)
@@ -232,47 +186,37 @@ def aislar_subconjunto_co2(datos_completos: pd.DataFrame, lista_respuestas: list
 
     fiv_interno_ok = True
     if len(factores_indep) > 1:
-        matriz_corr = datos_co2[factores_indep].corr(method='pearson')
         X = datos_co2[factores_indep].dropna()
-        
         if not X.empty:
             X_with_const = add_constant(X)
             try:
-                vifs = []
-                for i in range(1, X_with_const.shape[1]):
-                    vif_val = variance_inflation_factor(X_with_const.values, i)
-                    vifs.append(vif_val)
-                
+                vifs = [variance_inflation_factor(X_with_const.values, i) for i in range(1, X_with_const.shape[1])]
                 fiv_max = np.nanmax(vifs)
                 
                 if fiv_max > 5.0 or np.isinf(fiv_max):
                     msg = (f"Advertencia Estadística: Pérdida significativa de ortogonalidad al aislar el DSD. "
-                           f"FIV interno máximo = {fiv_max:.2f} (> 5.0). "
-                           f"Se anticipa alta multicolinealidad (aliasing) en los análisis siguientes.")
+                           f"FIV interno máximo = {fiv_max:.2f} (> 5.0).")
                     warnings.warn(msg, category=UserWarning)
                     fiv_interno_ok = False
                 else:
                     print(f"-> Ortogonalidad robusta preservada. FIV Interno Máximo: {fiv_max:.2f}")
-                    
             except Exception as e:
-                print(f"-> Nota: No se pudo calcular el FIV (posible matriz singular o varianza 0 en un factor): {e}")
+                print(f"-> Nota: No se pudo calcular el FIV: {e}")
                 fiv_interno_ok = True
 
     return datos_co2, fiv_interno_ok
 
-def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respuestas: list, l1_ratio: float, ruta_graficas: str) -> list:
+def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respuestas: list, l1_ratio: float, ruta_graficas: str, iteracion: int, transformar_marginadas: bool = False) -> list:
     """
-    Aplica regularización Elastic Net mediante validación cruzada para realizar 
-    reducción de dimensionalidad (Feature Selection). Filtra factores multicolineales 
-    e irrelevantes, reteniendo solo aquellos con coeficientes distintos de cero.
+    Filtro Dimensional Topológico. Expande la matriz a grado 2 (interacciones y cuadráticos),
+    aplica Elastic Net para lidiar con p > N, y mapea los términos sobrevivientes a sus factores madre.
     """
     factores_validos = [factor for factor in factores_sig if factor in datos_co2.columns]
     
     if not factores_validos:
-        raise ValueError("Error: Ninguno de los factores significativos existe como columna en el DataFrame de CO2.")
+        raise ValueError("Error: Ninguno de los factores continuos existe como columna en el DataFrame de CO2.")
     
-    print(f"\n--- FASE 3: REDUCCIÓN DE DIMENSIONALIDAD (ELASTIC NET | L1_RATIO = {l1_ratio}) ---")
-    print(f"-> Factores de entrada a la regularización: {len(factores_validos)}")
+    print(f"\n--- FASE 3: EXPANSIÓN POLINÓMICA Y ELASTIC NET (L1_RATIO = {l1_ratio}) ---")
     
     plt.rcParams.update({
         'font.family': 'serif', 'font.serif': ['Times New Roman'],
@@ -281,11 +225,19 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
         'figure.dpi': 300
     })
 
+    # Expansión Polinómica (Grado 2: Principales, Cuadráticos e Interacciones)
     X = datos_co2[factores_validos]
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    poly = PolynomialFeatures(degree=2, include_bias=False)
+    X_poly = poly.fit_transform(X)
+    poly_names = poly.get_feature_names_out(factores_validos)
     
-    variables_limpias = []
+    print(f"-> Matriz expandida de {X.shape[1]} a {X_poly.shape[1]} dimensiones topológicas.")
+
+    # Estandarización de la matriz expandida
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_poly)
+    
+    variables_limpias_madre = set()
 
     for resp in lista_respuestas:
         if resp not in datos_co2.columns:
@@ -296,15 +248,24 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
         X_curr = X_scaled[mascara_validos]
         y_curr = y[mascara_validos]
         
-        if len(y_curr) < 10 or np.var(y_curr) == 0:
-            print(f"  -> Omitiendo '{resp}': Varianza cero o datos insuficientes para CV.")
+        var_y = np.var(y_curr)
+        if len(y_curr) < 10 or var_y == 0:
+            print(f"  -> Omitiendo '{resp}': Varianza cero o datos insuficientes.")
             continue
+
+        # Transformación Matemática para Productos Marginales
+        if transformar_marginadas and var_y < 1e-4:
+            print(f"  -> Aplicando Yeo-Johnson a '{resp}' por baja varianza ({var_y:.2e}).")
+            pt = PowerTransformer(method='yeo-johnson', standardize=True)
+            y_curr_transformed = pt.fit_transform(y_curr.values.reshape(-1, 1)).ravel()
+        else:
+            y_curr_transformed = y_curr.values
 
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 modelo_enet = ElasticNetCV(l1_ratio=l1_ratio, cv=5, random_state=42, n_jobs=-1)
-                modelo_enet.fit(X_curr, y_curr)
+                modelo_enet.fit(X_curr, y_curr_transformed)
         except Exception as e:
             print(f"  -> Error al ajustar ElasticNet para '{resp}': {e}")
             continue
@@ -313,58 +274,61 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
         indices_no_cero = np.where(np.abs(coeficientes) > 0)[0]
         
         if len(indices_no_cero) > 0:
-            factores_retenidos = [factores_validos[i] for i in indices_no_cero]
-            variables_limpias.extend(factores_retenidos)
-            
+            terminos_retenidos = [poly_names[i] for i in indices_no_cero]
             coefs_grafico = coeficientes[indices_no_cero]
+            
+            # Mapeo Topológico: Extraer Factores Madre de los términos polinómicos
+            for term in terminos_retenidos:
+                # Los términos de PolynomialFeatures se separan por espacio (ej. "TIEMPO ALTURA" o "TIEMPO^2")
+                partes = term.split(' ')
+                for p in partes:
+                    madre = p.replace('^2', '')
+                    if madre in factores_validos:
+                        variables_limpias_madre.add(madre)
+            
+            # Gráfico de Barras de los Términos Polinómicos Sobrevivientes
             df_plot = pd.DataFrame({
-                'Factor': factores_retenidos,
+                'Término Polinómico': terminos_retenidos,
                 'Coeficiente': coefs_grafico
             }).sort_values(by='Coeficiente', key=abs, ascending=False)
             
-            # Asignación explícita de figura para Headless mode
-            fig = plt.figure(figsize=(8, 4))
-            
-            # Fix de Seaborn: Asignar a 'ax' y remover leyenda de forma segura
-            ax = sns.barplot(data=df_plot, x='Coeficiente', y='Factor', 
-                             palette='viridis', hue='Factor', dodge=False)
+            fig = plt.figure(figsize=(10, 6)) # Más ancho para acomodar nombres de interacciones
+            ax = sns.barplot(data=df_plot, x='Coeficiente', y='Término Polinómico', palette='viridis', hue='Término Polinómico', dodge=False)
             if ax.get_legend() is not None:
                 ax.get_legend().remove()
             
-            plt.title(f"Pesos Predictivos (Elastic Net) - {resp}", fontweight='bold', pad=10)
+            plt.title(f"Pesos Predictivos Topológicos (Elastic Net) - {resp} (Iter: {iteracion})", fontweight='bold', pad=10)
             plt.axvline(0, color='black', linewidth=1.2, linestyle='--')
             plt.xlabel("Magnitud del Coeficiente Estandarizado")
             plt.ylabel("")
             plt.tight_layout()
             
-            # Guardado dinámico y liberación de memoria
-            plt.savefig(f"{ruta_graficas}/ElasticNet_{resp}.png", bbox_inches='tight', dpi=300)
+            plt.savefig(f"{ruta_graficas}/ElasticNet_{resp}_iter_{iteracion}.png", bbox_inches='tight', dpi=300)
             plt.close(fig)
         else:
             print(f"  -> [{resp}]: Todos los factores fueron fuertemente penalizados a cero.")
 
-    variables_limpias_unicas = list(set(variables_limpias))
-    assert len(variables_limpias_unicas) > 0, "ElasticNet penalizó todas las variables a cero. El bucle principal deberá relajar los parámetros."
+    variables_limpias_unicas = list(variables_limpias_madre)
+    assert len(variables_limpias_unicas) > 0, "ElasticNet penalizó todas las variables a cero."
     
-    print(f"\n-> Elastic Net completado. Factores que sobrevivieron a la regularización ({len(variables_limpias_unicas)}):")
+    print(f"\n-> Elastic Net completado. Factores madre que sobrevivieron ({len(variables_limpias_unicas)}):")
     print(variables_limpias_unicas)
     
     return variables_limpias_unicas
 
-def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respuestas: list, ruta_graficas: str) -> tuple:
+def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respuestas: list, ruta_graficas: str, iteracion: int, transformar_marginadas: bool = False) -> tuple:
     """
-    Entrena un motor predictivo no lineal basado en Procesos Gaussianos (GPR) para 
-    cada variable de respuesta. Aplica validación cruzada para cuantificar el error 
-    y genera Gráficos de Dependencia Parcial (1D) con bandas de incertidumbre (95%).
+    Entrena un motor predictivo no lineal basado en Procesos Gaussianos (GPR).
+    Soporta transformaciones no lineales (Yeo-Johnson) para variables de baja varianza.
     """
     if not variables_limpias:
-        raise ValueError("Error crítico: La lista 'variables_limpias' está vacía. El GPR no tiene predictores.")
+        raise ValueError("Error crítico: La lista 'variables_limpias' está vacía.")
         
     factores_faltantes = [var for var in variables_limpias if var not in datos_co2.columns]
     if factores_faltantes:
         raise ValueError(f"Error: Los siguientes factores no existen en el DataFrame: {factores_faltantes}")
         
-    print("\n--- FASE 4: ENTRENAMIENTO DE PROCESOS GAUSSIANOS (GPR) Y CUANTIFICACIÓN DE INCERTIDUMBRE ---")
+    print("\n--- FASE 4: ENTRENAMIENTO DE PROCESOS GAUSSIANOS (GPR) ---")
 
     plt.rcParams.update({
         'font.family': 'serif', 'font.serif': ['Times New Roman'],
@@ -386,23 +350,25 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
         X_valido = X[mascara]
         y_valido = y[mascara].values.reshape(-1, 1)
         
-        if len(y_valido) < 10 or np.var(y_valido) == 0:
+        var_y = np.var(y_valido)
+        if len(y_valido) < 10 or var_y == 0:
             print(f"  -> Omitiendo '{resp}': Varianza cero o datos insuficientes.")
             continue
             
         scaler_X = StandardScaler()
-        scaler_y = StandardScaler()
+        
+        # Transformación Matemática Condicional
+        if transformar_marginadas and var_y < 1e-4:
+            print(f"  -> Aplicando Yeo-Johnson a '{resp}' por baja varianza ({var_y:.2e}).")
+            scaler_y = PowerTransformer(method='yeo-johnson', standardize=True)
+        else:
+            scaler_y = StandardScaler()
         
         X_scaled = scaler_X.fit_transform(X_valido)
         y_scaled = scaler_y.fit_transform(y_valido).ravel()
 
         kernel = Matern(nu=2.5) + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-5, 1e1))
-        
-        gpr = GaussianProcessRegressor(
-            kernel=kernel, 
-            n_restarts_optimizer=10,
-            random_state=42
-        )
+        gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10, random_state=42)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -427,7 +393,6 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
 
         top_2_vars = variables_limpias[:2] if len(variables_limpias) >= 2 else variables_limpias
         
-        # Asignación explícita de figura y ejes para Headless mode
         fig, axes = plt.subplots(1, len(top_2_vars), figsize=(6 * len(top_2_vars), 4.5))
         if len(top_2_vars) == 1: axes = [axes]
         
@@ -439,20 +404,18 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
             X_test_scaled[:, idx_feature] = x_synth
             
             mean_scaled, std_scaled = gpr.predict(X_test_scaled, return_std=True)
-            assert len(std_scaled) == len(mean_scaled), "Fallo de dimensión: Mismatch entre media y desviación estándar."
+            assert len(std_scaled) == len(mean_scaled), "Fallo de dimensión en GPR."
             
+            # Decodificación robusta para transformaciones no lineales (sin depender de .scale_)
             mean_real = scaler_y.inverse_transform(mean_scaled.reshape(-1, 1)).flatten()
-            std_real = std_scaled * scaler_y.scale_[0] 
+            upper_real = scaler_y.inverse_transform((mean_scaled + std_scaled).reshape(-1, 1)).flatten()
+            lower_real = scaler_y.inverse_transform((mean_scaled - std_scaled).reshape(-1, 1)).flatten()
+            std_real = (upper_real - lower_real) / 2.0
             
             x_real = scaler_X.inverse_transform(X_test_scaled)[:, idx_feature]
             
             ax.plot(x_real, mean_real, 'b-', label='Predicción (Media)', linewidth=2)
-            ax.fill_between(
-                x_real, 
-                mean_real - 1.96 * std_real, 
-                mean_real + 1.96 * std_real, 
-                color='blue', alpha=0.2, label='95% Intervalo Confianza'
-            )
+            ax.fill_between(x_real, mean_real - 1.96 * std_real, mean_real + 1.96 * std_real, color='blue', alpha=0.2, label='95% IC')
             
             ax.set_title(f"Efecto Aislado: {feature_name}", fontweight='bold')
             ax.set_xlabel(feature_name)
@@ -460,23 +423,20 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
             ax.legend(loc='best', frameon=False)
             ax.grid(True, linestyle='--', alpha=0.5)
 
-        plt.suptitle(f"Dependencia Parcial GPR - {resp}", fontsize=14, fontweight='bold', y=1.02)
+        plt.suptitle(f"Dependencia Parcial GPR - {resp} (Iter: {iteracion})", fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         
-        # Guardado dinámico y liberación de memoria
-        plt.savefig(f"{ruta_graficas}/GPR_{resp}.png", bbox_inches='tight', dpi=300)
+        plt.savefig(f"{ruta_graficas}/GPR_{resp}_iter_{iteracion}.png", bbox_inches='tight', dpi=300)
         plt.close(fig)
 
     ecm_cv_promedio = float(np.mean(ecm_list)) if ecm_list else np.nan
-    print(f"\n-> Entrenamiento finalizado. ECM Promedio Global (Escala Std): {ecm_cv_promedio:.4f}")
+    print(f"\n-> Entrenamiento finalizado. ECM Promedio Global: {ecm_cv_promedio:.4f}")
     
     return modelos_gpr, ecm_cv_promedio
 
 def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: list, diccionario_respuestas: dict) -> tuple:
     """
     Motor de Optimización Bayesiana para buscar las condiciones operativas ideales.
-    Utiliza Differential Evolution sobre la función de adquisición LCB del espacio 
-    probabilístico modelado por Procesos Gaussianos.
     """
     print("\n--- FASE 5: OPTIMIZACIÓN BAYESIANA MULTIOBJETIVO Y TOPOLOGÍA ---")
     
@@ -492,12 +452,10 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
     lim_reales_inf = scaler_X_base.inverse_transform(limites_std_inf.reshape(1, -1))[0]
     lim_reales_sup = scaler_X_base.inverse_transform(limites_std_sup.reshape(1, -1))[0]
     
-    bounds = list(zip(np.minimum(lim_reales_inf, lim_reales_sup), 
-                      np.maximum(lim_reales_inf, lim_reales_sup)))
+    bounds = list(zip(np.minimum(lim_reales_inf, lim_reales_sup), np.maximum(lim_reales_inf, lim_reales_sup)))
 
     def funcion_objetivo(x):
         adquisiciones = []
-        
         for resp, directiva in diccionario_respuestas.items():
             if directiva.lower() == 'none' or resp not in modelos_gpr:
                 continue 
@@ -506,8 +464,7 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
             x_scaled = m_dict['scaler_X'].transform(x.reshape(1, -1))
             
             mu_scaled, std_scaled = m_dict['modelo'].predict(x_scaled, return_std=True)
-            mu = mu_scaled[0]
-            std = std_scaled[0]
+            mu, std = mu_scaled[0], std_scaled[0]
             
             if directiva.lower() == 'max':
                 acq = mu - (kappa * std)
@@ -518,26 +475,18 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
                 
             adquisiciones.append(acq)
             
-        if not adquisiciones:
-            return 0.0
+        if not adquisiciones: return 0.0
 
         adq_norm = expit(adquisiciones)
         deseabilidad_global = np.exp(np.mean(np.log(adq_norm + 1e-12)))
-        
         return -deseabilidad_global
 
     print("  -> Evolucionando hiperespacio con Algoritmo Genético Diferencial...")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         resultado = differential_evolution(
-            funcion_objetivo, 
-            bounds=bounds, 
-            strategy='best1bin', 
-            maxiter=1500, 
-            popsize=15, 
-            mutation=(0.5, 1.0), 
-            recombination=0.7, 
-            seed=42
+            funcion_objetivo, bounds=bounds, strategy='best1bin', 
+            maxiter=1500, popsize=15, mutation=(0.5, 1.0), recombination=0.7, seed=42
         )
         
     x_optimo = resultado.x
@@ -557,17 +506,14 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
     rango_espacial = np.array([b[1] - b[0] for b in bounds])
     
     puntos_vecinos = [
-        x_optimo + 0.02 * rango_espacial,
-        x_optimo - 0.02 * rango_espacial,
-        x_optimo * 1.02,
-        x_optimo * 0.98
+        x_optimo + 0.02 * rango_espacial, x_optimo - 0.02 * rango_espacial,
+        x_optimo * 1.02, x_optimo * 0.98
     ]
     
     superficie_estable = True
     for vec in puntos_vecinos:
         vec_clip = np.clip(vec, [b[0] for b in bounds], [b[1] for b in bounds])
         sigma_vecino = obtener_sigma_promedio(vec_clip)
-        
         if sigma_centroide > 0 and sigma_vecino > 1.20 * sigma_centroide:
             superficie_estable = False
             break
@@ -578,7 +524,6 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
         print("  -> ADVERTENCIA: Singularidad Operativa detectada. Gradiente de incertidumbre peligroso cerca del óptimo.")
 
     datos_output = {}
-    
     for i, var in enumerate(variables_limpias):
         datos_output[f"SetPoint_{var}"] = np.round(x_optimo[i], 4)
         
@@ -588,12 +533,49 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
             x_sc_final = m_dict['scaler_X'].transform(x_optimo.reshape(1, -1))
             mu_sc_final, std_sc_final = m_dict['modelo'].predict(x_sc_final, return_std=True)
             
+            # Decodificación robusta para transformaciones no lineales
             mu_real = m_dict['scaler_y'].inverse_transform(mu_sc_final.reshape(-1, 1))[0][0]
-            std_real = std_sc_final[0] * m_dict['scaler_y'].scale_[0]
+            upper_real = m_dict['scaler_y'].inverse_transform((mu_sc_final + std_sc_final).reshape(-1, 1))[0][0]
+            lower_real = m_dict['scaler_y'].inverse_transform((mu_sc_final - std_sc_final).reshape(-1, 1))[0][0]
+            std_real = (upper_real - lower_real) / 2.0
             
             datos_output[f"E_Pred_{resp}"] = np.round(mu_real, 4)
             datos_output[f"E_Std_{resp}"] = np.round(std_real, 4)
             
     top_optimos = pd.DataFrame([datos_output])
-    
     return top_optimos, superficie_estable
+
+def generar_gifs_evolucion(ruta_graficas: str, lista_respuestas: list, max_iteraciones: int):
+    """
+    Recopila los gráficos guardados en cada iteración y genera un archivo GIF animado 
+    para visualizar la evolución del aprendizaje del modelo por cada respuesta.
+    """
+    print("\n--- FASE 6: GENERACIÓN DE MULTIMEDIA (GIFs EVOLUTIVOS) ---")
+    tipos_graficos = ['superficie_RSM', 'ElasticNet', 'GPR']
+    
+    gifs_creados = 0
+    for resp in lista_respuestas:
+        # Limpieza de nombre para coincidir con el guardado en RSM
+        resp_clean = re.sub(r'_+', '_', re.sub(r'[^a-zA-Z0-9_]', '_', str(resp))).strip('_')
+        
+        for tipo in tipos_graficos:
+            frames = []
+            for i in range(1, max_iteraciones + 1):
+                # RSM usa el nombre limpio, ElasticNet y GPR usan el original
+                nombre_base = resp_clean if tipo == 'superficie_RSM' else resp
+                filepath = os.path.join(ruta_graficas, f"{tipo}_{nombre_base}_iter_{i}.png")
+                
+                if not os.path.exists(filepath):
+                    # Fallback por si acaso
+                    filepath = os.path.join(ruta_graficas, f"{tipo}_{resp}_iter_{i}.png")
+                    
+                if os.path.exists(filepath):
+                    frames.append(Image.open(filepath))
+            
+            if len(frames) > 1:
+                gif_path = os.path.join(ruta_graficas, f"Evolucion_{tipo}_{resp_clean}.gif")
+                # Guardar el GIF con un loop infinito y 800ms por frame
+                frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=800, loop=0)
+                gifs_creados += 1
+                
+    print(f"-> Proceso multimedia finalizado. Se generaron {gifs_creados} GIFs animados en '{ruta_graficas}'.")

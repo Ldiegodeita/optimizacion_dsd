@@ -4,13 +4,14 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# Importamos las capas
+# Importamos las capas (incluyendo el generador de GIFs)
 from mis_capas import (
     ejecutar_anova_global, 
     aislar_subconjunto_co2, 
     aplicar_elastic_net, 
     entrenar_gpr, 
-    buscar_optimo_bayesiano
+    buscar_optimo_bayesiano,
+    generar_gifs_evolucion
 )
 
 class DSDConfigurator:
@@ -114,7 +115,7 @@ class DSDConfigurator:
     def iniciar_pipeline(self):
         for col, cb in self.comboboxes.items():
             self.configuracion[col] = cb.get()
-        # FIX ARQUITECTÓNICO: Solo detenemos el mainloop, NO destruimos la ventana aún.
+        # Solo detenemos el mainloop, NO destruimos la ventana aún.
         self.root.quit() 
 
 def orquestador_principal():
@@ -129,16 +130,16 @@ def orquestador_principal():
         root.destroy()
         return
         
-    # FIX ARQUITECTÓNICO: Rescatar variables a memoria local ANTES de destruir la ventana
+    # Rescatar variables a memoria local ANTES de destruir la ventana
     df = app.datos.copy()
     configuracion_local = app.configuracion.copy()
-    root.destroy() # Ahora sí, liberamos los recursos de la GUI de forma segura
+    root.destroy() # Liberamos los recursos de la GUI de forma segura
     
     print("\n" + "="*60)
     print(" PREPROCESAMIENTO Y CODIFICACIÓN DE VARIABLES ")
     print("="*60)
     
-    # 1. Limpieza Profunda: Eliminación de BOM (Fantasma de Minitab) y espacios
+    # 1. Limpieza Profunda: Eliminación de BOM y espacios
     nombres_limpios = {c: str(c).strip().replace('\ufeff', '') for c in df.columns}
     df.rename(columns=nombres_limpios, inplace=True)
     
@@ -148,7 +149,7 @@ def orquestador_principal():
     cols_ignorar = [c for c, rol in config.items() if "Ignorar" in rol]
     cols_categoricas = [c for c, rol in config.items() if "Categórico" in rol]
     
-    # --- PROTECCIÓN ESTRUCTURAL (PARCHE PARA LA CAPA 1) ---
+    # --- PROTECCIÓN ESTRUCTURAL ---
     col_atm = next((c for c in cols_categoricas if 'atm' in c.lower() or 'gas' in c.lower()), None)
     
     if col_atm:
@@ -157,7 +158,6 @@ def orquestador_principal():
         print(f"-> Columna '{col_atm}' identificada, protegida de One-Hot y estandarizada a 'Atmósfera'.")
     else:
         print("-> ADVERTENCIA: No se detectó ninguna columna de atmósfera.")
-    # ------------------------------------------------------
     
     diccionario_respuestas = {}
     for c, rol in config.items():
@@ -170,7 +170,7 @@ def orquestador_principal():
     
     df.drop(columns=cols_ignorar, inplace=True, errors='ignore')
     
-    # Codificación One-Hot (El Ánodo sí pasará por aquí y se volverá binario)
+    # Codificación One-Hot
     if cols_categoricas:
         print(f"-> Aplicando One-Hot Encoding a: {cols_categoricas}")
         df = pd.get_dummies(df, columns=cols_categoricas, drop_first=True, dtype=float)
@@ -182,41 +182,82 @@ def orquestador_principal():
     os.makedirs(ruta_tablas, exist_ok=True)
     print(f"-> Directorios de salida asegurados en: {ruta_base}")
     
-    hiperparametros = {'alpha': 0.15, 'l1_ratio': 0.5, 'kappa': 1.96, 'umbral_ecm': 0.5}
+    lista_todas_resp = list(diccionario_respuestas.keys())
+    hiperparametros = {'alpha': 0.05, 'l1_ratio': 0.5, 'kappa': 1.96, 'umbral_ecm': 0.5}
+
+    # =========================================================================
+    # EJECUCIÓN ÚNICA: CAPA 1 Y 1.5 (FUERA DEL BUCLE)
+    # =========================================================================
+    print("\n" + "="*60)
+    print(" FASE 1 & 1.5: ANOVA GLOBAL Y AISLAMIENTO DE CO2 (EJECUCIÓN ÚNICA) ")
+    print("="*60)
+    
+    try:
+        # Capa 1: Ahora retorna la lista completa de factores continuos (sin filtrar)
+        factores_continuos, residuos_ok = ejecutar_anova_global(
+            df, hiperparametros['alpha'], lista_todas_resp, ruta_tablas, ruta_graficas, iteracion=1
+        )
+        
+        # Capa 1.5: Aislamiento del subespacio CO2
+        datos_co2, fiv_interno_ok = aislar_subconjunto_co2(
+            df, lista_todas_resp
+        )
+    except Exception as e:
+        print(f"\n❌ Error Crítico durante la inicialización del pipeline: {e}")
+        return
+
+    # =========================================================================
+    # CONFIGURACIÓN DEL BUCLE DE RESILIENCIA Y ELITISMO
+    # =========================================================================
     optimo_validado = False
     iteracion = 1
     max_iteraciones = 5
     
-    lista_todas_resp = list(diccionario_respuestas.keys())
+    # Variables de Memoria de Convergencia (Elitismo)
+    mejor_ecm = float('inf')
+    mejor_optimo = None
+    mejor_iteracion = 0
     
     while not optimo_validado and iteracion <= max_iteraciones:
-        print(f"\n--- INICIANDO ITERACIÓN {iteracion} ---")
+        print(f"\n" + "="*40)
+        print(f" INICIANDO ITERACIÓN {iteracion} / {max_iteraciones} ")
+        print("="*40)
         
+        # TRANSFORMACIÓN DINÁMICA DE PARÁMETROS
+        activar_transformacion = True if iteracion >= 3 else False
+        if activar_transformacion:
+            print("  -> [INFO] Transformación matemática de variables marginales ACTIVADA.")
+
         try:
-            factores_sig, residuos_ok = ejecutar_anova_global(
-                df, hiperparametros['alpha'], lista_todas_resp, ruta_tablas, ruta_graficas
-            )
-            
-            datos_co2, fiv_interno_ok = aislar_subconjunto_co2(
-                df, lista_todas_resp
-            )
-            
-            # FIX ARQUITECTÓNICO: Inyección de dependencia ruta_graficas
+            # Capa 2: Elastic Net (Feature Selection Topológico) sobre datos_co2
+            # Recibe los factores continuos base y se encarga de la expansión polinómica
             variables_limpias = aplicar_elastic_net(
-                datos_co2, factores_sig, lista_todas_resp, hiperparametros['l1_ratio'], ruta_graficas
+                datos_co2, factores_continuos, lista_todas_resp, hiperparametros['l1_ratio'], 
+                ruta_graficas, iteracion, transformar_marginadas=activar_transformacion
             )
             
-            # FIX ARQUITECTÓNICO: Inyección de dependencia ruta_graficas
+            # Capa 3: Gaussian Process Regressor sobre datos_co2
             modelos_gpr, ecm_cv_promedio = entrenar_gpr(
-                datos_co2, variables_limpias, lista_todas_resp, ruta_graficas
+                datos_co2, variables_limpias, lista_todas_resp, 
+                ruta_graficas, iteracion, transformar_marginadas=activar_transformacion
             )
             
+            # Capa 4: Optimización Bayesiana
             top_optimos, superficie_estable = buscar_optimo_bayesiano(
                 modelos_gpr, hiperparametros['kappa'], variables_limpias, diccionario_respuestas
             )
             
+            # MEMORIA DE CONVERGENCIA (ELITISMO)
+            if ecm_cv_promedio < mejor_ecm:
+                mejor_ecm = ecm_cv_promedio
+                mejor_optimo = top_optimos.copy()
+                mejor_iteracion = iteracion
+                print(f"  -> [ELITISMO] Nuevo mejor modelo guardado en memoria (ECM: {mejor_ecm:.4f})")
+            
+            # CONDICIÓN DE ÉXITO ESTRICTA
             if superficie_estable and ecm_cv_promedio < hiperparametros['umbral_ecm']:
                 print("\n✅ ÓPTIMO GLOBAL ENCONTRADO Y VALIDADO")
+                print(f"Iteración de convergencia: {iteracion}")
                 print("\nCondiciones Operativas Recomendadas:")
                 print(top_optimos.to_string(index=False))
                 optimo_validado = True
@@ -227,18 +268,36 @@ def orquestador_principal():
                 continue
                 
         except Exception as e:
-            # FIX ARQUITECTÓNICO: Bucle de Resiliencia (Auto-Healing)
+            # BUCLE DE RESILIENCIA (AUTO-HEALING)
             print(f"\n⚠️ Error Crítico en la iteración {iteracion}: {e}")
             print("  -> Auto-corrigiendo hiperparámetros y reintentando...")
             
             # Relajamos la penalización L1 para permitir que pasen más variables si ElasticNet asfixió el modelo
-            hiperparametros['l1_ratio'] = max(0.1, hiperparametros['l1_ratio'] - 0.20)
-            
-            # Relajamos el umbral ANOVA por si se descartaron demasiados factores en el primer paso
-            hiperparametros['alpha'] = min(0.25, hiperparametros['alpha'] + 0.05)
+            hiperparametros['l1_ratio'] = max(0.1, hiperparametros['l1_ratio'] - 0.15)
             
             iteracion += 1
             continue
+
+    # =========================================================================
+    # CIERRE DEL PIPELINE Y GENERACIÓN MULTIMEDIA
+    # =========================================================================
+    
+    # Rescate de Elitismo si el bucle falló en encontrar un óptimo perfecto
+    if not optimo_validado:
+        print("\n" + "="*60)
+        print("⚠️ ADVERTENCIA: Se alcanzó el máximo de iteraciones sin convergencia estable absoluta.")
+        if mejor_optimo is not None:
+            print(f"-> Rescatando el mejor óptimo encontrado (Iteración {mejor_iteracion} | ECM: {mejor_ecm:.4f}):")
+            print(mejor_optimo.to_string(index=False))
+        else:
+            print("-> No se logró generar ningún modelo válido en ninguna iteración.")
+        print("="*60)
+
+    # Generación de GIFs Evolutivos
+    print("\nGenerando animaciones de la evolución del modelo...")
+    iteraciones_totales = iteracion if optimo_validado else iteracion - 1
+    if iteraciones_totales > 0:
+        generar_gifs_evolucion(ruta_graficas, lista_todas_resp, iteraciones_totales)
 
 if __name__ == "__main__":
     orquestador_principal()
