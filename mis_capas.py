@@ -29,7 +29,7 @@ from sklearn.preprocessing import StandardScaler, PowerTransformer, PolynomialFe
 from sklearn.linear_model import ElasticNetCV
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
-from sklearn.model_selection import KFold, cross_val_score
+from sklearn.model_selection import KFold, cross_val_score, LeaveOneOut
 
 # 6. Visualización Científica y Multimedia (Matplotlib, Seaborn, PIL)
 import matplotlib.pyplot as plt
@@ -209,7 +209,8 @@ def aislar_subconjunto_co2(datos_completos: pd.DataFrame, lista_respuestas: list
 def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respuestas: list, l1_ratio: float, ruta_graficas: str, iteracion: int, transformar_marginadas: bool = False) -> list:
     """
     Filtro Dimensional Topológico. Expande la matriz a grado 2 (interacciones y cuadráticos),
-    aplica Elastic Net para lidiar con p > N, y mapea los términos sobrevivientes a sus factores madre.
+    aplica Elastic Net con LeaveOneOut CV para proteger la estructura del DSD, 
+    y mapea los términos sobrevivientes a sus factores madre.
     """
     factores_validos = [factor for factor in factores_sig if factor in datos_co2.columns]
     
@@ -264,7 +265,8 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                modelo_enet = ElasticNetCV(l1_ratio=l1_ratio, cv=5, random_state=42, n_jobs=-1)
+                # CRÍTICO: LeaveOneOut() protege la ortogonalidad del DSD evitando particiones aleatorias
+                modelo_enet = ElasticNetCV(l1_ratio=l1_ratio, cv=LeaveOneOut(), random_state=42, n_jobs=-1)
                 modelo_enet.fit(X_curr, y_curr_transformed)
         except Exception as e:
             print(f"  -> Error al ajustar ElasticNet para '{resp}': {e}")
@@ -279,7 +281,6 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
             
             # Mapeo Topológico: Extraer Factores Madre de los términos polinómicos
             for term in terminos_retenidos:
-                # Los términos de PolynomialFeatures se separan por espacio (ej. "TIEMPO ALTURA" o "TIEMPO^2")
                 partes = term.split(' ')
                 for p in partes:
                     madre = p.replace('^2', '')
@@ -292,7 +293,7 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
                 'Coeficiente': coefs_grafico
             }).sort_values(by='Coeficiente', key=abs, ascending=False)
             
-            fig = plt.figure(figsize=(10, 6)) # Más ancho para acomodar nombres de interacciones
+            fig = plt.figure(figsize=(10, 6))
             ax = sns.barplot(data=df_plot, x='Coeficiente', y='Término Polinómico', palette='viridis', hue='Término Polinómico', dodge=False)
             if ax.get_legend() is not None:
                 ax.get_legend().remove()
@@ -319,7 +320,7 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
 def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respuestas: list, ruta_graficas: str, iteracion: int, transformar_marginadas: bool = False) -> tuple:
     """
     Entrena un motor predictivo no lineal basado en Procesos Gaussianos (GPR).
-    Soporta transformaciones no lineales (Yeo-Johnson) para variables de baja varianza.
+    Incluye WhiteKernel explícito para absorber la varianza de las réplicas del DSD.
     """
     if not variables_limpias:
         raise ValueError("Error crítico: La lista 'variables_limpias' está vacía.")
@@ -367,6 +368,7 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
         X_scaled = scaler_X.fit_transform(X_valido)
         y_scaled = scaler_y.fit_transform(y_valido).ravel()
 
+        # CRÍTICO: Matern para suavidad + WhiteKernel para absorber el error puro de las réplicas
         kernel = Matern(nu=2.5) + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-5, 1e1))
         gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10, random_state=42)
 
@@ -406,7 +408,7 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
             mean_scaled, std_scaled = gpr.predict(X_test_scaled, return_std=True)
             assert len(std_scaled) == len(mean_scaled), "Fallo de dimensión en GPR."
             
-            # Decodificación robusta para transformaciones no lineales (sin depender de .scale_)
+            # Decodificación robusta para transformaciones no lineales
             mean_real = scaler_y.inverse_transform(mean_scaled.reshape(-1, 1)).flatten()
             upper_real = scaler_y.inverse_transform((mean_scaled + std_scaled).reshape(-1, 1)).flatten()
             lower_real = scaler_y.inverse_transform((mean_scaled - std_scaled).reshape(-1, 1)).flatten()
@@ -436,7 +438,8 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
 
 def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: list, diccionario_respuestas: dict) -> tuple:
     """
-    Motor de Optimización Bayesiana para buscar las condiciones operativas ideales.
+    Motor de Optimización Bayesiana.
+    Restringe rígidamente la búsqueda al dominio experimental [-1.0, 1.0] para evitar extrapolación.
     """
     print("\n--- FASE 5: OPTIMIZACIÓN BAYESIANA MULTIOBJETIVO Y TOPOLOGÍA ---")
     
@@ -446,8 +449,9 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
     primer_resp = list(modelos_gpr.keys())[0]
     scaler_X_base = modelos_gpr[primer_resp]['scaler_X']
     
-    limites_std_inf = np.full(len(variables_limpias), -1.5)
-    limites_std_sup = np.full(len(variables_limpias), 1.5)
+    # CRÍTICO: Clamping estricto en [-1.0, 1.0] para evitar extrapolación en el DSD
+    limites_std_inf = np.full(len(variables_limpias), -1.0)
+    limites_std_sup = np.full(len(variables_limpias), 1.0)
     
     lim_reales_inf = scaler_X_base.inverse_transform(limites_std_inf.reshape(1, -1))[0]
     lim_reales_sup = scaler_X_base.inverse_transform(limites_std_sup.reshape(1, -1))[0]
@@ -512,6 +516,7 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
     
     superficie_estable = True
     for vec in puntos_vecinos:
+        # El clipping asegura que los vecinos evaluados no se salgan del dominio [-1.0, 1.0]
         vec_clip = np.clip(vec, [b[0] for b in bounds], [b[1] for b in bounds])
         sigma_vecino = obtener_sigma_promedio(vec_clip)
         if sigma_centroide > 0 and sigma_vecino > 1.20 * sigma_centroide:
@@ -533,7 +538,6 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
             x_sc_final = m_dict['scaler_X'].transform(x_optimo.reshape(1, -1))
             mu_sc_final, std_sc_final = m_dict['modelo'].predict(x_sc_final, return_std=True)
             
-            # Decodificación robusta para transformaciones no lineales
             mu_real = m_dict['scaler_y'].inverse_transform(mu_sc_final.reshape(-1, 1))[0][0]
             upper_real = m_dict['scaler_y'].inverse_transform((mu_sc_final + std_sc_final).reshape(-1, 1))[0][0]
             lower_real = m_dict['scaler_y'].inverse_transform((mu_sc_final - std_sc_final).reshape(-1, 1))[0][0]
@@ -555,18 +559,15 @@ def generar_gifs_evolucion(ruta_graficas: str, lista_respuestas: list, max_itera
     
     gifs_creados = 0
     for resp in lista_respuestas:
-        # Limpieza de nombre para coincidir con el guardado en RSM
         resp_clean = re.sub(r'_+', '_', re.sub(r'[^a-zA-Z0-9_]', '_', str(resp))).strip('_')
         
         for tipo in tipos_graficos:
             frames = []
             for i in range(1, max_iteraciones + 1):
-                # RSM usa el nombre limpio, ElasticNet y GPR usan el original
                 nombre_base = resp_clean if tipo == 'superficie_RSM' else resp
                 filepath = os.path.join(ruta_graficas, f"{tipo}_{nombre_base}_iter_{i}.png")
                 
                 if not os.path.exists(filepath):
-                    # Fallback por si acaso
                     filepath = os.path.join(ruta_graficas, f"{tipo}_{resp}_iter_{i}.png")
                     
                 if os.path.exists(filepath):
@@ -574,7 +575,6 @@ def generar_gifs_evolucion(ruta_graficas: str, lista_respuestas: list, max_itera
             
             if len(frames) > 1:
                 gif_path = os.path.join(ruta_graficas, f"Evolucion_{tipo}_{resp_clean}.gif")
-                # Guardar el GIF con un loop infinito y 800ms por frame
                 frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=800, loop=0)
                 gifs_creados += 1
                 

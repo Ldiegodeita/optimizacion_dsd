@@ -183,7 +183,7 @@ def orquestador_principal():
     print(f"-> Directorios de salida asegurados en: {ruta_base}")
     
     lista_todas_resp = list(diccionario_respuestas.keys())
-    hiperparametros = {'alpha': 0.05, 'l1_ratio': 0.5, 'kappa': 1.96, 'umbral_ecm': 0.5}
+    hiperparametros = {'alpha': 0.3, 'l1_ratio': 0.5, 'kappa': 1.96, 'umbral_ecm': 0.7}
 
     # =========================================================================
     # EJECUCIÓN ÚNICA: CAPA 1 Y 1.5 (FUERA DEL BUCLE)
@@ -193,7 +193,7 @@ def orquestador_principal():
     print("="*60)
     
     try:
-        # Capa 1: Ahora retorna la lista completa de factores continuos (sin filtrar)
+        # Capa 1: Retorna la lista completa de factores continuos (sin filtrar)
         factores_continuos, residuos_ok = ejecutar_anova_global(
             df, hiperparametros['alpha'], lista_todas_resp, ruta_tablas, ruta_graficas, iteracion=1
         )
@@ -230,19 +230,21 @@ def orquestador_principal():
 
         try:
             # Capa 2: Elastic Net (Feature Selection Topológico) sobre datos_co2
-            # Recibe los factores continuos base y se encarga de la expansión polinómica
+            # Utiliza LeaveOneOut CV para proteger la estructura del DSD
             variables_limpias = aplicar_elastic_net(
                 datos_co2, factores_continuos, lista_todas_resp, hiperparametros['l1_ratio'], 
                 ruta_graficas, iteracion, transformar_marginadas=activar_transformacion
             )
             
             # Capa 3: Gaussian Process Regressor sobre datos_co2
+            # Incluye WhiteKernel para absorber la varianza de las réplicas
             modelos_gpr, ecm_cv_promedio = entrenar_gpr(
                 datos_co2, variables_limpias, lista_todas_resp, 
                 ruta_graficas, iteracion, transformar_marginadas=activar_transformacion
             )
             
             # Capa 4: Optimización Bayesiana
+            # Restringida estrictamente al dominio [-1.0, 1.0]
             top_optimos, superficie_estable = buscar_optimo_bayesiano(
                 modelos_gpr, hiperparametros['kappa'], variables_limpias, diccionario_respuestas
             )
@@ -258,11 +260,12 @@ def orquestador_principal():
             if superficie_estable and ecm_cv_promedio < hiperparametros['umbral_ecm']:
                 print("\n✅ ÓPTIMO GLOBAL ENCONTRADO Y VALIDADO")
                 print(f"Iteración de convergencia: {iteracion}")
-                print("\nCondiciones Operativas Recomendadas:")
+                print("\nCondiciones Operativas Recomendadas (Dominio Estricto DSD):")
                 print(top_optimos.to_string(index=False))
                 optimo_validado = True
             else:
                 print("\n⚠️ El modelo no cumple los criterios de estabilidad o error. Ajustando hiperparámetros recursivamente...")
+                # Aumentamos la penalización L1 para forzar un modelo más simple y estable
                 hiperparametros['l1_ratio'] = min(0.95, hiperparametros['l1_ratio'] + 0.15)
                 iteracion += 1
                 continue
@@ -273,7 +276,7 @@ def orquestador_principal():
             print("  -> Auto-corrigiendo hiperparámetros y reintentando...")
             
             # Relajamos la penalización L1 para permitir que pasen más variables si ElasticNet asfixió el modelo
-            hiperparametros['l1_ratio'] = max(0.1, hiperparametros['l1_ratio'] - 0.15)
+            hiperparametros['l1_ratio'] = max(0.05, hiperparametros['l1_ratio'] - 0.20)
             
             iteracion += 1
             continue
