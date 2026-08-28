@@ -4,13 +4,15 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# Importamos las capas (incluyendo el generador de GIFs)
+# Importamos las capas (incluyendo Benchmark OLS y Active Learning)
 from mis_capas import (
     ejecutar_anova_global, 
+    optimizar_benchmark_ols,
     aislar_subconjunto_co2, 
     aplicar_elastic_net, 
     entrenar_gpr, 
     buscar_optimo_bayesiano,
+    generar_guia_experimentos_activa,
     generar_gifs_evolucion
 )
 
@@ -183,7 +185,6 @@ def orquestador_principal():
     print(f"-> Directorios de salida asegurados en: {ruta_base}")
     
     lista_todas_resp = list(diccionario_respuestas.keys())
-    hiperparametros = {'alpha': 0.3, 'l1_ratio': 0.5, 'kappa': 1.96, 'umbral_ecm': 0.7}
 
     # =========================================================================
     # EJECUCIÓN ÚNICA: CAPA 1 Y 1.5 (FUERA DEL BUCLE)
@@ -193,112 +194,143 @@ def orquestador_principal():
     print("="*60)
     
     try:
-        # Capa 1: Retorna la lista completa de factores continuos (sin filtrar)
-        factores_continuos, residuos_ok = ejecutar_anova_global(
-            df, hiperparametros['alpha'], lista_todas_resp, ruta_tablas, ruta_graficas, iteracion=1
+        # Capa 1: Retorna factores, residuos, modelos OLS y contexto de codificación
+        factores_continuos, residuos_ok, modelos_ols, contexto_ols = ejecutar_anova_global(
+            df, alpha=0.05, lista_respuestas=lista_todas_resp, 
+            ruta_tablas=ruta_tablas, ruta_graficas=ruta_graficas, iteracion=1
         )
         
         # Capa 1.5: Aislamiento del subespacio CO2
         datos_co2, fiv_interno_ok = aislar_subconjunto_co2(
             df, lista_todas_resp
         )
+        
     except Exception as e:
         print(f"\n❌ Error Crítico durante la inicialización del pipeline: {e}")
         return
 
     # =========================================================================
-    # CONFIGURACIÓN DEL BUCLE DE RESILIENCIA Y ELITISMO
+    # CONFIGURACIÓN DEL CALENDARIO DE ENFRIAMIENTO (HEURÍSTICA POR FASES)
     # =========================================================================
+    fases_opt = [
+        {'fase': 1, 'alpha': 0.15, 'ecm': 0.50, 'l1': 0.5, 'kappa': 1.96, 'calidad': 'Alta'},
+        {'fase': 2, 'alpha': 0.20, 'ecm': 0.60, 'l1': 0.6, 'kappa': 1.50, 'calidad': 'Media'},
+        {'fase': 3, 'alpha': 0.30, 'ecm': 0.75, 'l1': 0.8, 'kappa': 1.00, 'calidad': 'Baja (Relajado)'}
+    ]
+    
     optimo_validado = False
-    iteracion = 1
-    max_iteraciones = 5
+    iteracion_global = 1
     
     # Variables de Memoria de Convergencia (Elitismo)
     mejor_ecm = float('inf')
     mejor_optimo = None
-    mejor_iteracion = 0
+    mejor_modelos_gpr = None
+    mejor_calidad = "Ninguna"
     
-    while not optimo_validado and iteracion <= max_iteraciones:
-        print(f"\n" + "="*40)
-        print(f" INICIANDO ITERACIÓN {iteracion} / {max_iteraciones} ")
-        print("="*40)
+    for fase in fases_opt:
+        if optimo_validado:
+            break
+            
+        print(f"\n" + "="*50)
+        print(f" INICIANDO FASE {fase['fase']} (Calidad Esperada: {fase['calidad']}) ")
+        print("="*50)
+        
+        # Extraemos hiperparámetros de la fase actual
+        l1_ratio = fase['l1']
+        umbral_ecm = fase['ecm']
+        kappa = fase['kappa']
+        
+        print(f"\n--- Iteración Global {iteracion_global} (Fase {fase['fase']}) ---")
         
         # TRANSFORMACIÓN DINÁMICA DE PARÁMETROS
-        activar_transformacion = True if iteracion >= 3 else False
+        activar_transformacion = True if iteracion_global >= 3 else False
         if activar_transformacion:
             print("  -> [INFO] Transformación matemática de variables marginales ACTIVADA.")
 
         try:
-            # Capa 2: Elastic Net (Feature Selection Topológico) sobre datos_co2
-            # Utiliza LeaveOneOut CV para proteger la estructura del DSD
+            # Capa 2: Elastic Net (Feature Selection Topológico)
             variables_limpias = aplicar_elastic_net(
-                datos_co2, factores_continuos, lista_todas_resp, hiperparametros['l1_ratio'], 
-                ruta_graficas, iteracion, transformar_marginadas=activar_transformacion
+                datos_co2, factores_continuos, lista_todas_resp, l1_ratio, 
+                ruta_graficas, iteracion_global, transformar_marginadas=activar_transformacion
             )
             
-            # Capa 3: Gaussian Process Regressor sobre datos_co2
-            # Incluye WhiteKernel para absorber la varianza de las réplicas
+            # Capa 3: Gaussian Process Regressor
             modelos_gpr, ecm_cv_promedio = entrenar_gpr(
                 datos_co2, variables_limpias, lista_todas_resp, 
-                ruta_graficas, iteracion, transformar_marginadas=activar_transformacion
+                ruta_graficas, iteracion_global, transformar_marginadas=activar_transformacion
             )
             
             # Capa 4: Optimización Bayesiana
-            # Restringida estrictamente al dominio [-1.0, 1.0]
             top_optimos, superficie_estable = buscar_optimo_bayesiano(
-                modelos_gpr, hiperparametros['kappa'], variables_limpias, diccionario_respuestas
+                modelos_gpr, kappa, variables_limpias, diccionario_respuestas
             )
             
             # MEMORIA DE CONVERGENCIA (ELITISMO)
             if ecm_cv_promedio < mejor_ecm:
                 mejor_ecm = ecm_cv_promedio
                 mejor_optimo = top_optimos.copy()
-                mejor_iteracion = iteracion
+                mejor_modelos_gpr = modelos_gpr
+                mejor_calidad = fase['calidad']
                 print(f"  -> [ELITISMO] Nuevo mejor modelo guardado en memoria (ECM: {mejor_ecm:.4f})")
             
             # CONDICIÓN DE ÉXITO ESTRICTA
-            if superficie_estable and ecm_cv_promedio < hiperparametros['umbral_ecm']:
+            if superficie_estable and ecm_cv_promedio < umbral_ecm:
                 print("\n✅ ÓPTIMO GLOBAL ENCONTRADO Y VALIDADO")
-                print(f"Iteración de convergencia: {iteracion}")
-                print("\nCondiciones Operativas Recomendadas (Dominio Estricto DSD):")
-                print(top_optimos.to_string(index=False))
                 optimo_validado = True
+                break
             else:
-                print("\n⚠️ El modelo no cumple los criterios de estabilidad o error. Ajustando hiperparámetros recursivamente...")
-                # Aumentamos la penalización L1 para forzar un modelo más simple y estable
-                hiperparametros['l1_ratio'] = min(0.95, hiperparametros['l1_ratio'] + 0.15)
-                iteracion += 1
-                continue
+                print("\n⚠️ Criterios no cumplidos. Pasando a la siguiente fase de enfriamiento...")
                 
         except Exception as e:
             # BUCLE DE RESILIENCIA (AUTO-HEALING)
-            print(f"\n⚠️ Error Crítico en la iteración {iteracion}: {e}")
-            print("  -> Auto-corrigiendo hiperparámetros y reintentando...")
-            
-            # Relajamos la penalización L1 para permitir que pasen más variables si ElasticNet asfixió el modelo
-            hiperparametros['l1_ratio'] = max(0.05, hiperparametros['l1_ratio'] - 0.20)
-            
-            iteracion += 1
-            continue
+            print(f"\n⚠️ Error en la Fase {fase['fase']} (Iteración {iteracion_global}): {e}")
+            print("  -> Pasando a la siguiente fase de enfriamiento...")
+
+        iteracion_global += 1
 
     # =========================================================================
-    # CIERRE DEL PIPELINE Y GENERACIÓN MULTIMEDIA
+    # CIERRE DEL PIPELINE, COMPARATIVA Y EXPORTACIÓN
     # =========================================================================
     
-    # Rescate de Elitismo si el bucle falló en encontrar un óptimo perfecto
+    print("\n" + "="*60)
+    print(" RESULTADOS FINALES Y EXPORTACIÓN ")
+    print("="*60)
+    
     if not optimo_validado:
-        print("\n" + "="*60)
-        print("⚠️ ADVERTENCIA: Se alcanzó el máximo de iteraciones sin convergencia estable absoluta.")
+        print("⚠️ ADVERTENCIA: Se agotaron las fases de enfriamiento sin convergencia estable absoluta.")
         if mejor_optimo is not None:
-            print(f"-> Rescatando el mejor óptimo encontrado (Iteración {mejor_iteracion} | ECM: {mejor_ecm:.4f}):")
-            print(mejor_optimo.to_string(index=False))
+            print(f"-> Rescatando el mejor óptimo encontrado (ECM: {mejor_ecm:.4f} | Calidad: {mejor_calidad}).")
         else:
-            print("-> No se logró generar ningún modelo válido en ninguna iteración.")
-        print("="*60)
+            print("❌ FATAL: No se logró generar ningún modelo válido en ninguna iteración.")
+            return
 
-    # Generación de GIFs Evolutivos
+    # 1. Benchmark Lineal OLS
+    df_optimo_ols = optimizar_benchmark_ols(modelos_ols, diccionario_respuestas, contexto_ols)
+
+    # 2. Comparativa en Consola
+    print("\n=== COMPARATIVA DE ÓPTIMOS ===")
+    print("Óptimo Clásico (OLS):")
+    print(df_optimo_ols.to_string(index=False))
+    print("\nÓptimo Inteligente (GPR):")
+    print(mejor_optimo.to_string(index=False))
+
+    # 3. Exportación de Óptimos a CSV
+    df_optimo_ols.to_csv(os.path.join(ruta_base, 'Optimo_Global_OLS.csv'), index=False)
+    
+    mejor_optimo['Calidad_Modelo'] = mejor_calidad
+    mejor_optimo.to_csv(os.path.join(ruta_base, 'Optimo_Global_GPR.csv'), index=False)
+    print(f"\n-> Óptimos exportados exitosamente a '{ruta_base}'.")
+
+    # 4. Guía de Aprendizaje Activo (Active Learning)
+    if mejor_modelos_gpr is not None:
+        df_activa = generar_guia_experimentos_activa(mejor_modelos_gpr)
+        ruta_activa = os.path.join(ruta_base, 'Guia_Nuevos_Experimentos_ActiveLearning.csv')
+        df_activa.to_csv(ruta_activa)
+        print(f"-> Guía de Aprendizaje Activo exportada a '{ruta_activa}'.")
+
+    # 5. Generación de GIFs Evolutivos
     print("\nGenerando animaciones de la evolución del modelo...")
-    iteraciones_totales = iteracion if optimo_validado else iteracion - 1
+    iteraciones_totales = iteracion_global if optimo_validado else iteracion_global - 1
     if iteraciones_totales > 0:
         generar_gifs_evolucion(ruta_graficas, lista_todas_resp, iteraciones_totales)
 
