@@ -3,7 +3,7 @@ import warnings
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-
+#R!
 # Importamos las capas (incluyendo Benchmark OLS y Active Learning)
 from mis_capas import (
     ejecutar_anova_global, 
