@@ -195,6 +195,7 @@ def orquestador_principal():
     
     try:
         # Capa 1: Retorna factores, residuos, modelos OLS y contexto de codificación
+        # Se ejecuta una sola vez con alpha=0.05 para el análisis frecuentista base
         factores_continuos, residuos_ok, modelos_ols, contexto_ols = ejecutar_anova_global(
             df, alpha=0.05, lista_respuestas=lista_todas_resp, 
             ruta_tablas=ruta_tablas, ruta_graficas=ruta_graficas, iteracion=1
@@ -213,9 +214,9 @@ def orquestador_principal():
     # CONFIGURACIÓN DEL CALENDARIO DE ENFRIAMIENTO (HEURÍSTICA POR FASES)
     # =========================================================================
     fases_opt = [
-        {'fase': 1, 'alpha': 0.15, 'ecm': 0.50, 'l1': 0.5, 'kappa': 1.96, 'calidad': 'Alta'},
-        {'fase': 2, 'alpha': 0.20, 'ecm': 0.60, 'l1': 0.6, 'kappa': 1.50, 'calidad': 'Media'},
-        {'fase': 3, 'alpha': 0.30, 'ecm': 0.75, 'l1': 0.8, 'kappa': 1.00, 'calidad': 'Baja (Relajado)'}
+        {'fase': 1, 'ecm': 0.50, 'l1': 0.5, 'kappa': 1.96, 'calidad': 'Alta'},
+        {'fase': 2, 'ecm': 0.60, 'l1': 0.6, 'kappa': 1.50, 'calidad': 'Media'},
+        {'fase': 3, 'ecm': 0.75, 'l1': 0.8, 'kappa': 1.00, 'calidad': 'Baja (Relajado)'}
     ]
     
     optimo_validado = False
@@ -236,57 +237,66 @@ def orquestador_principal():
         print("="*50)
         
         # Extraemos hiperparámetros de la fase actual
-        l1_ratio = fase['l1']
-        umbral_ecm = fase['ecm']
-        kappa = fase['kappa']
+        hiperparametros = fase.copy()
         
-        print(f"\n--- Iteración Global {iteracion_global} (Fase {fase['fase']}) ---")
-        
-        # TRANSFORMACIÓN DINÁMICA DE PARÁMETROS
-        activar_transformacion = True if iteracion_global >= 3 else False
-        if activar_transformacion:
-            print("  -> [INFO] Transformación matemática de variables marginales ACTIVADA.")
-
-        try:
-            # Capa 2: Elastic Net (Feature Selection Topológico)
-            variables_limpias = aplicar_elastic_net(
-                datos_co2, factores_continuos, lista_todas_resp, l1_ratio, 
-                ruta_graficas, iteracion_global, transformar_marginadas=activar_transformacion
-            )
-            
-            # Capa 3: Gaussian Process Regressor
-            modelos_gpr, ecm_cv_promedio = entrenar_gpr(
-                datos_co2, variables_limpias, lista_todas_resp, 
-                ruta_graficas, iteracion_global, transformar_marginadas=activar_transformacion
-            )
-            
-            # Capa 4: Optimización Bayesiana
-            top_optimos, superficie_estable = buscar_optimo_bayesiano(
-                modelos_gpr, kappa, variables_limpias, diccionario_respuestas
-            )
-            
-            # MEMORIA DE CONVERGENCIA (ELITISMO)
-            if ecm_cv_promedio < mejor_ecm:
-                mejor_ecm = ecm_cv_promedio
-                mejor_optimo = top_optimos.copy()
-                mejor_modelos_gpr = modelos_gpr
-                mejor_calidad = fase['calidad']
-                print(f"  -> [ELITISMO] Nuevo mejor modelo guardado en memoria (ECM: {mejor_ecm:.4f})")
-            
-            # CONDICIÓN DE ÉXITO ESTRICTA
-            if superficie_estable and ecm_cv_promedio < umbral_ecm:
-                print("\n✅ ÓPTIMO GLOBAL ENCONTRADO Y VALIDADO")
-                optimo_validado = True
+        # Intentamos 2 iteraciones por cada fase de relajación
+        for intento in range(1, 3):
+            if optimo_validado:
                 break
-            else:
-                print("\n⚠️ Criterios no cumplidos. Pasando a la siguiente fase de enfriamiento...")
                 
-        except Exception as e:
-            # BUCLE DE RESILIENCIA (AUTO-HEALING)
-            print(f"\n⚠️ Error en la Fase {fase['fase']} (Iteración {iteracion_global}): {e}")
-            print("  -> Pasando a la siguiente fase de enfriamiento...")
+            print(f"\n--- Iteración Global {iteracion_global} (Fase {fase['fase']} - Intento {intento}) ---")
+            
+            # TRANSFORMACIÓN DINÁMICA DE PARÁMETROS
+            activar_transformacion = True if iteracion_global >= 3 else False
+            if activar_transformacion:
+                print("  -> [INFO] Transformación matemática de variables marginales ACTIVADA.")
 
-        iteracion_global += 1
+            try:
+                # Capa 2: Elastic Net (Feature Selection Topológico)
+                variables_limpias = aplicar_elastic_net(
+                    datos_co2, factores_continuos, lista_todas_resp, hiperparametros['l1'], 
+                    ruta_graficas, iteracion_global, transformar_marginadas=activar_transformacion
+                )
+                
+                # Capa 3: Gaussian Process Regressor
+                modelos_gpr, ecm_cv_promedio = entrenar_gpr(
+                    datos_co2, variables_limpias, lista_todas_resp, 
+                    ruta_graficas, iteracion_global, transformar_marginadas=activar_transformacion
+                )
+                
+                # Capa 4: Optimización Bayesiana
+                top_optimos, superficie_estable = buscar_optimo_bayesiano(
+                    modelos_gpr, hiperparametros['kappa'], variables_limpias, diccionario_respuestas
+                )
+                
+                # MEMORIA DE CONVERGENCIA (ELITISMO)
+                if ecm_cv_promedio < mejor_ecm:
+                    mejor_ecm = ecm_cv_promedio
+                    mejor_optimo = top_optimos.copy()
+                    mejor_modelos_gpr = modelos_gpr
+                    mejor_calidad = hiperparametros['calidad']
+                    print(f"  -> [ELITISMO] Nuevo mejor modelo guardado en memoria (ECM: {mejor_ecm:.4f})")
+                
+                # CONDICIÓN DE ÉXITO ESTRICTA
+                if superficie_estable and ecm_cv_promedio < hiperparametros['ecm']:
+                    print("\n✅ ÓPTIMO GLOBAL ENCONTRADO Y VALIDADO")
+                    optimo_validado = True
+                    break
+                else:
+                    print("\n⚠️ Criterios no cumplidos. Ajustando hiperparámetros recursivamente...")
+                    hiperparametros['l1'] = max(0.05, hiperparametros['l1'] - 0.15)
+                    iteracion_global += 1
+                    continue
+                    
+            except Exception as e:
+                # BUCLE DE RESILIENCIA (AUTO-HEALING)
+                print(f"\n⚠️ Error Crítico en la iteración {iteracion_global}: {e}")
+                print("  -> Auto-corrigiendo hiperparámetros y reintentando...")
+                
+                hiperparametros['l1'] = max(0.05, hiperparametros['l1'] - 0.20)
+                
+                iteracion_global += 1
+                continue
 
     # =========================================================================
     # CIERRE DEL PIPELINE, COMPARATIVA Y EXPORTACIÓN

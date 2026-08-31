@@ -47,6 +47,8 @@ def ejecutar_anova_global(datos_completos: pd.DataFrame, alpha: float, lista_res
     """
     Ejecuta un análisis RSM Global (OLS completo sin Stepwise) para evaluar 
     la varianza base, exportar la tabla ANOVA completa y generar gráficos 3D iniciales.
+    Retorna la lista completa de factores continuos originales, el estado de los residuos,
+    los modelos OLS entrenados y el contexto de codificación.
     """
     assert not datos_completos.empty, "Error: El DataFrame de entrada está vacío."
     warnings.filterwarnings("ignore")
@@ -179,6 +181,10 @@ def optimizar_benchmark_ols(modelos_ols: dict, diccionario_respuestas: dict, con
     """
     Benchmark Lineal (MINLP): Optimiza las funciones predictivas lineales (OLS) 
     aplicando Branching para variables categóricas.
+    
+    Motor de Deseabilidad: Utiliza una transformación sigmoidal suave expit(adquisiciones) 
+    combinada con la media geométrica del espacio logarítmico np.exp(np.mean(np.log(adq_norm + 1e-12)))
+    para la optimización multiobjetivo.
     """
     print("\n--- FASE EXTRA: OPTIMIZACIÓN BENCHMARK LINEAL (OLS MINLP) ---")
     cont_vars = contexto_ols['cont_vars']
@@ -194,68 +200,77 @@ def optimizar_benchmark_ols(modelos_ols: dict, diccionario_respuestas: dict, con
     ramas = list(product([-1.0, 1.0], repeat=len(binarias))) if binarias else [()]
     bounds_cont = [(-1.0, 1.0) for _ in continuas]
 
+    # OPTIMIZACIÓN DE MEMORIA: Pre-crear el DataFrame para no instanciarlo miles de veces
+    df_pred = pd.DataFrame({cat_var: [1.0]})
+    for var in cont_vars:
+        df_pred[var] = 0.0
+
+    def funcion_objetivo(x):
+        # Actualizar valores in-place es mucho más rápido que crear un DataFrame nuevo
+        for i, var in enumerate(cont_vars):
+            df_pred.at[0, var] = x[i]
+
+        adquisiciones = []
+        for resp, directiva in diccionario_respuestas.items():
+            if directiva.lower() == 'none' or resp not in modelos_ols:
+                continue
+            
+            pred = modelos_ols[resp].predict(df_pred).iloc[0]
+            
+            if directiva.lower() == 'max':
+                acq = pred
+            elif directiva.lower() == 'min':
+                acq = -pred
+            else:
+                continue
+            adquisiciones.append(acq)
+
+        if not adquisiciones: return 0.0
+        
+        adq_norm = expit(adquisiciones)
+        deseabilidad = np.exp(np.mean(np.log(adq_norm + 1e-12)))
+        return -deseabilidad
+
     best_res = None
     best_val = float('inf')
-    best_rama = None
     np.random.seed(42)
     
-    for rama in ramas:
-        def funcion_objetivo(x_cont):
-            df_pred = pd.DataFrame({cat_var: [1.0]}) # Forzamos CO2
-            for i, b_var in enumerate(binarias):
-                df_pred[b_var] = [rama[i]]
-            for i, c_var in enumerate(continuas):
-                df_pred[c_var] = [x_cont[i]]
-
-            adquisiciones = []
-            for resp, directiva in diccionario_respuestas.items():
-                if directiva.lower() == 'none' or resp not in modelos_ols:
-                    continue
-                pred = modelos_ols[resp].predict(df_pred).iloc[0]
-                acq = pred if directiva.lower() == 'max' else -pred
-                adquisiciones.append(acq)
-
-            if not adquisiciones: return 0.0
-            adq_norm = expit(adquisiciones)
-            deseabilidad = np.exp(np.mean(np.log(adq_norm + 1e-12)))
-            return -deseabilidad
-
-        for _ in range(5): # Multi-start por rama
-            x0 = np.random.uniform(-1.0, 1.0, len(continuas)) if continuas else np.array([])
-            if continuas:
-                res = minimize(funcion_objetivo, x0, bounds=bounds_cont, method='L-BFGS-B')
-                val = res.fun
-                x_res = res.x
-            else:
-                val = funcion_objetivo([])
-                x_res = np.array([])
-                
-            if val < best_val:
-                best_val = val
-                best_res = x_res
-                best_rama = rama
-
-    datos_output = {}
-    df_pred_opt = pd.DataFrame({cat_var: [1.0]})
+    # CRITERIO DE SALIDA Y PROGRESO: Reducimos a 3 intentos y limitamos iteraciones
+    intentos = 3
+    print(f"  -> Iniciando búsqueda de óptimo lineal ({intentos} arranques). Límite: 50 iteraciones/arranque.")
     
-    for i, var in enumerate(binarias):
-        # Decodificar binarias (0 o 1)
-        val_real = 1.0 if best_rama[i] > 0 else 0.0
-        datos_output[f"SetPoint_{inv_map[var]}"] = val_real
-        df_pred_opt[var] = [best_rama[i]]
+    for i in range(intentos):
+        x0 = np.random.uniform(-1.0, 1.0, len(cont_vars))
         
-    for i, var in enumerate(continuas):
+        # options={'maxiter': 50} fuerza la salida para que no se congele
+        res = minimize(funcion_objetivo, x0, bounds=bounds_cont, method='L-BFGS-B', 
+                       options={'maxiter': 50, 'maxfun': 500, 'disp': False})
+        
+        print(f"     [Avance] Intento {i+1}/{intentos} completado | Deseabilidad: {-res.fun:.4f}")
+        
+        if res.fun < best_val:
+            best_val = res.fun
+            best_res = res
+
+    x_optimo_coded = best_res.x
+    datos_output = {}
+    
+    # Decodificación a unidades reales
+    for i, var in enumerate(cont_vars):
         min_v, max_v = scale_params[var]
-        val_real = (best_res[i] + 1) * (max_v - min_v) / 2.0 + min_v
+        val_real = (x_optimo_coded[i] + 1) * (max_v - min_v) / 2.0 + min_v
         datos_output[f"SetPoint_{inv_map[var]}"] = np.round(val_real, 4)
-        df_pred_opt[var] = [best_res[i]]
+
+    # Predicciones finales del Benchmark
+    for i, var in enumerate(cont_vars):
+        df_pred.at[0, var] = x_optimo_coded[i]
 
     for resp, directiva in diccionario_respuestas.items():
         if directiva.lower() != 'none' and resp in modelos_ols:
-            pred = modelos_ols[resp].predict(df_pred_opt).iloc[0]
+            pred = modelos_ols[resp].predict(df_pred).iloc[0]
             datos_output[f"OLS_Pred_{resp}"] = np.round(pred, 4)
 
-    print("  -> Benchmark Lineal OLS completado exitosamente.")
+    print("  -> Benchmark Lineal OLS finalizado con éxito.")
     return pd.DataFrame([datos_output])
 
 def aislar_subconjunto_co2(datos_completos: pd.DataFrame, lista_respuestas: list) -> tuple:
@@ -305,8 +320,9 @@ def aislar_subconjunto_co2(datos_completos: pd.DataFrame, lista_respuestas: list
 
 def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respuestas: list, l1_ratio: float, ruta_graficas: str, iteracion: int, transformar_marginadas: bool = False) -> list:
     """
-    Filtro Dimensional Topológico. Expande la matriz a grado 2, aplica Elastic Net 
-    con LeaveOneOut CV y mapea los términos sobrevivientes a sus factores madre.
+    Filtro Dimensional Topológico. Expande la matriz a grado 2 (interacciones y cuadráticos),
+    aplica Elastic Net con LeaveOneOut CV para proteger la estructura del DSD, 
+    y mapea los términos sobrevivientes a sus factores madre.
     """
     factores_validos = [factor for factor in factores_sig if factor in datos_co2.columns]
     
@@ -358,6 +374,7 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
+                # CRÍTICO: LeaveOneOut() protege la ortogonalidad del DSD evitando particiones aleatorias
                 modelo_enet = ElasticNetCV(l1_ratio=l1_ratio, cv=LeaveOneOut(), random_state=42, n_jobs=-1)
                 modelo_enet.fit(X_curr, y_curr_transformed)
         except Exception as e:
@@ -410,7 +427,8 @@ def aplicar_elastic_net(datos_co2: pd.DataFrame, factores_sig: list, lista_respu
 def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respuestas: list, ruta_graficas: str, iteracion: int, transformar_marginadas: bool = False) -> tuple:
     """
     Entrena un motor predictivo no lineal basado en Procesos Gaussianos (GPR).
-    Genera dinámicamente Superficies 3D RSM evidenciando la curvatura aprendida.
+    Incluye WhiteKernel explícito para absorber la varianza de las réplicas del DSD.
+    Utiliza LeaveOneOut CV para proteger la ortogonalidad en conjuntos de datos reducidos.
     """
     if not variables_limpias:
         raise ValueError("Error crítico: La lista 'variables_limpias' está vacía.")
@@ -465,12 +483,14 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
         X_scaled = scaler_X.fit_transform(X_valido)
         y_scaled = scaler_y.fit_transform(y_valido).ravel()
 
+        # CRÍTICO: Matern para suavidad + WhiteKernel para absorber el error puro de las réplicas
         kernel = Matern(nu=2.5) + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-5, 1e1))
         gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10, random_state=42)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            cv = KFold(n_splits=5, shuffle=True, random_state=42)
+            # CRÍTICO: LeaveOneOut() protege la ortogonalidad del DSD en la evaluación del error
+            cv = LeaveOneOut()
             scores_cv = cross_val_score(gpr, X_scaled, y_scaled, cv=cv, scoring='neg_mean_squared_error')
             
         ecm_respuesta = np.abs(scores_cv.mean())
@@ -489,7 +509,7 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
             'tipos': tipos_var
         }
         
-        print(f"  -> [{resp}] GPR Entrenado | ECM (CV Estandarizado): {ecm_respuesta:.4f}")
+        print(f"  -> [{resp}] GPR Entrenado | ECM (LOOCV Estandarizado): {ecm_respuesta:.4f}")
 
         # Generación Dinámica de RSM 3D
         binarias = [v for v in variables_limpias if tipos_var[v] == 'binaria']
@@ -561,7 +581,11 @@ def entrenar_gpr(datos_co2: pd.DataFrame, variables_limpias: list, lista_respues
 def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: list, diccionario_respuestas: dict) -> tuple:
     """
     Motor de Optimización Bayesiana (MINLP).
-    Aplica Branching para variables categóricas (0 o 1) y optimiza continuas en sus límites reales.
+    Aplica Branching para variables categóricas (0 o 1) y optimiza continuas en sus límites normalizados [-1.0, 1.0].
+    
+    Motor de Deseabilidad: Utiliza una transformación sigmoidal suave expit(adquisiciones) 
+    combinada con la media geométrica del espacio logarítmico np.exp(np.mean(np.log(adq_norm + 1e-12)))
+    para la optimización multiobjetivo.
     """
     print("\n--- FASE 5: OPTIMIZACIÓN BAYESIANA MULTIOBJETIVO Y TOPOLOGÍA (MINLP) ---")
     
@@ -576,7 +600,9 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
     continuas = [v for v in variables_limpias if tipos[v] == 'continua']
     
     ramas = list(product([0.0, 1.0], repeat=len(binarias))) if binarias else [()]
-    bounds_cont = [bounds_dict[c] for c in continuas]
+    
+    # CRÍTICO: Clamping estricto en [-1.0, 1.0] para evitar extrapolación en el DSD
+    bounds_cont = [(-1.0, 1.0) for _ in continuas]
 
     best_val = float('inf')
     best_x_cont = None
@@ -585,12 +611,16 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
 
     for rama in ramas:
         def funcion_objetivo(x_cont):
-            x_full = np.zeros(len(variables_limpias))
+            # Construcción del vector en unidades reales para la evaluación
+            x_full_real = np.zeros(len(variables_limpias))
             for i, var in enumerate(variables_limpias):
                 if var in binarias:
-                    x_full[i] = rama[binarias.index(var)]
+                    x_full_real[i] = rama[binarias.index(var)]
                 else:
-                    x_full[i] = x_cont[continuas.index(var)]
+                    c_val = x_cont[continuas.index(var)]
+                    min_v, max_v = bounds_dict[var]
+                    # Decodificación de [-1.0, 1.0] a unidades físicas reales
+                    x_full_real[i] = (c_val + 1.0) * (max_v - min_v) / 2.0 + min_v
                     
             adquisiciones = []
             for resp, directiva in diccionario_respuestas.items():
@@ -598,7 +628,8 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
                     continue 
                     
                 m_dict = modelos_gpr[resp]
-                x_scaled = m_dict['scaler_X'].transform(x_full.reshape(1, -1))
+                # El scaler_X fue entrenado con unidades reales, por lo que transformamos x_full_real
+                x_scaled = m_dict['scaler_X'].transform(x_full_real.reshape(1, -1))
                 
                 mu_scaled, std_scaled = m_dict['modelo'].predict(x_scaled, return_std=True)
                 mu, std = mu_scaled[0], std_scaled[0]
@@ -618,7 +649,7 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
             return -deseabilidad_global
 
         for _ in range(10): # Multi-start por rama
-            x0 = np.random.uniform([b[0] for b in bounds_cont], [b[1] for b in bounds_cont]) if continuas else np.array([])
+            x0 = np.random.uniform(-1.0, 1.0, len(continuas)) if continuas else np.array([])
             if continuas:
                 res = minimize(funcion_objetivo, x0, bounds=bounds_cont, method='L-BFGS-B')
                 val = res.fun
@@ -634,13 +665,15 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
 
     print("  -> Convergencia del Óptimo Global MINLP alcanzada.")
 
-    # Reconstrucción del vector óptimo completo
+    # Reconstrucción del vector óptimo completo en unidades reales
     x_optimo = np.zeros(len(variables_limpias))
     for i, var in enumerate(variables_limpias):
         if var in binarias:
             x_optimo[i] = best_rama[binarias.index(var)]
         else:
-            x_optimo[i] = best_x_cont[continuas.index(var)]
+            c_val = best_x_cont[continuas.index(var)]
+            min_v, max_v = bounds_dict[var]
+            x_optimo[i] = (c_val + 1.0) * (max_v - min_v) / 2.0 + min_v
 
     # Análisis de Sensibilidad Topológica (Solo perturbamos continuas)
     def obtener_sigma_promedio(x_val):
@@ -660,6 +693,7 @@ def buscar_optimo_bayesiano(modelos_gpr: dict, kappa: float, variables_limpias: 
         vecino = x_optimo.copy()
         for i, var in enumerate(variables_limpias):
             if tipos[var] == 'continua':
+                # Perturbación del 2% basada en el rango real de la variable
                 vecino[i] += vec * (bounds_dict[var][1] - bounds_dict[var][0])
         puntos_vecinos.append(vecino)
     
